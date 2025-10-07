@@ -1,0 +1,6 @@
+psycopg[binary]==3.*
+cassandra-driver==3.*
+pandas==2.*
+python-dotenv==1.*
+pytz==2024.*
+loguru==0.7.*

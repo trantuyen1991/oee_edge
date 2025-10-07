@@ -1,0 +1,39 @@
+# === Python general ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# === Virtual environment ===
+.venv/
+env/
+venv/
+
+# === Logs & runtime ===
+logs/
+*.log
+
+# === IDEs ===
+.vscode/
+.idea/
+*.code-workspace
+
+# === OS generated ===
+.DS_Store
+Thumbs.db
+
+# === Cache & temp ===
+*.tmp
+*.bak
+*.swp
+*~
+.cache/
+dist/
+build/
+*.egg-info/
+
+# === Env & secrets ===
+.env
+.env.*
+
