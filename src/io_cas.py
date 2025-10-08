@@ -1,9 +1,12 @@
-# English comments per your style
+# io_cas.py
+from typing import List, Tuple
 import os
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Tuple
 from cassandra.cluster import Cluster
 from cassandra.query import SimpleStatement
+from datetime import datetime, timezone
+import uuid  
+
+ENTITY_TYPE = "DEVICE"  # fixed for device telemetry
 
 def get_cas_session():
     """
@@ -11,9 +14,55 @@ def get_cas_session():
     """
     contact_points = os.getenv("CAS_CONTACT_POINTS", "127.0.0.1").split(",")
     port = int(os.getenv("CAS_PORT", "9042"))
+    keyspace = os.getenv("CAS_KEYSPACE", "thingsboard")
     cluster = Cluster(contact_points=contact_points, port=port)
-    session = cluster.connect(os.getenv("CAS_KEYSPACE"))
+    session = cluster.connect(keyspace)
     return session
+
+def _get_partitions(session, entity_id: str, key: str, ts_from_ms: int, ts_to_ms: int) -> List[int]:
+    """
+    Read partitions for (entity_id, key) covering [ts_from_ms, ts_to_ms].
+    NOTE: entity_id in TB tables is type timeuuid, so convert from string.
+    """
+    # Convert to UUID type if it's string
+    if isinstance(entity_id, str):
+        entity_id = uuid.UUID(entity_id)
+
+    q = SimpleStatement("""
+        SELECT partition FROM ts_kv_partitions_cf
+        WHERE entity_id = %s AND entity_type = %s AND key = %s
+        ALLOW FILTERING
+    """)
+    rows = session.execute(q, (entity_id, ENTITY_TYPE, key))
+    parts = sorted({r.partition for r in rows})
+    return parts
+
+def fetch_timeseries_numeric(session, entity_id: str, key: str, ts_from_ms: int, ts_to_ms: int) -> List[Tuple[int, float]]:
+    """
+    Fetch numeric values (double/long) from ts_kv_cf for a given key and window.
+    Returns list of (ts_ms, value) sorted ascending.
+    """
+    import uuid
+    if isinstance(entity_id, str):
+        entity_id = uuid.UUID(entity_id)
+
+    parts = _get_partitions(session, entity_id, key, ts_from_ms, ts_to_ms)
+    data: List[Tuple[int, float]] = []
+    q = SimpleStatement("""
+        SELECT ts, dbl_v, long_v
+        FROM ts_kv_cf
+        WHERE entity_id = %s AND entity_type = %s AND key = %s AND partition = %s
+          AND ts >= %s AND ts < %s
+        ALLOW FILTERING
+    """)
+    for p in parts:
+        rows = session.execute(q, (entity_id, ENTITY_TYPE, key, p, ts_from_ms, ts_to_ms))
+        for r in rows:
+            val = r.dbl_v if r.dbl_v is not None else (float(r.long_v) if r.long_v is not None else None)
+            if val is not None:
+                data.append((r.ts, float(val)))
+    data.sort(key=lambda x: x[0])
+    return data
 
 def fetch_cumulative_points(session, device_id: str, key: str, ts_from_ms: int, ts_to_ms: int) -> List[Tuple[int, float]]:
     """
@@ -26,6 +75,32 @@ def fetch_cumulative_points(session, device_id: str, key: str, ts_from_ms: int, 
     # rows = session.execute(query, (device_id, key, ts_from_ms, ts_to_ms))
     # return sorted([(r.ts, r.dbl_v) for r in rows], key=lambda x: x[0])
     return []  # TODO: implement your real query
+
+def fetch_timeseries_text(session, entity_id: str, key: str, ts_from_ms: int, ts_to_ms: int) -> List[Tuple[int, str]]:
+    """
+    Fetch text values (str_v/json_v) for a key and window.
+    """
+    import uuid
+    if isinstance(entity_id, str):
+        entity_id = uuid.UUID(entity_id)
+
+    parts = _get_partitions(session, entity_id, key, ts_from_ms, ts_to_ms)
+    data: List[Tuple[int, str]] = []
+    q = SimpleStatement("""
+        SELECT ts, str_v, json_v
+        FROM ts_kv_cf
+        WHERE entity_id = %s AND entity_type = %s AND key = %s AND partition = %s
+          AND ts >= %s AND ts < %s
+        ALLOW FILTERING
+    """)
+    for p in parts:
+        rows = session.execute(q, (entity_id, ENTITY_TYPE, key, p, ts_from_ms, ts_to_ms))
+        for r in rows:
+            val = r.str_v if r.str_v is not None else r.json_v
+            if val is not None:
+                data.append((r.ts, val))
+    data.sort(key=lambda x: x[0])
+    return data
 
 def fetch_state_timeline(session, device_id: str, ts_from_ms: int, ts_to_ms: int) -> List[Tuple[int, str]]:
     """

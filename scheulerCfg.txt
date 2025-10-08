@@ -1,0 +1,52 @@
+#6. Tạo service + timer (systemd)
+    /etc/systemd/system/oee-etl.service
+[Unit]
+Description=OEE ETL minute job (PostgreSQL upsert)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=admin
+WorkingDirectory=/home/admin/oee-edge
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/admin/oee-edge/.venv/bin/python -u src/etl_minute.py
+# Prevent overlapping runs (let timer handle cadence)
+RuntimeMaxSec=50
+
+    /etc/systemd/system/oee-etl.timer
+[Unit]
+Description=Run OEE ETL every minute with +20s offset
+
+[Timer]
+OnCalendar=*:0/1
+AccuracySec=1s
+Persistent=true
+Unit=oee-etl.service
+# Delay 20s to wait for late arrivals
+RandomizedDelaySec=0
+
+Bật dịch vụ:
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now oee-etl.timer
+# Kiểm tra
+systemctl status oee-etl.timer
+journalctl -u oee-etl.service -f
+
+Nếu muốn offset +20s “cứng”, có thể đổi oee-etl.service thành ExecStartPre=/bin/sleep 20.
+
+#7. Kiểm thử nhanh
+    Chạy thủ công một lần:
+        source ~/oee-edge/.venv/bin/activate
+        python -u ~/oee-edge/src/etl_minute.py
+    Kiểm tra kết quả:
+        -- Kiểm tra số dòng mới trong khoảng 15 phút gần đây
+        SELECT 
+            line_id, 
+            MIN(ts_min) AS from_min, 
+            MAX(ts_min) AS to_min, 
+            COUNT(*) AS rows
+        FROM fact_production_min
+        WHERE ts_min >= NOW() AT TIME ZONE 'UTC' - INTERVAL '15 minutes'
+        GROUP BY line_id;
