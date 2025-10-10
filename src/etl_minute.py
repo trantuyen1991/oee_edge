@@ -5,7 +5,7 @@ ETL job to compute 1-minute OEE buckets and upsert into fact_production_min.
 - Use cumulative counters to compute deltas
 - Compute runtime_sec from state timeline
 """
-
+from pathlib import Path                                     # path utilities
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Tuple
@@ -19,33 +19,27 @@ from io_pg import (
     upsert_fact_min,             # vẫn import, dù hiện tại chưa dùng
     load_packaging_snapshot,     # optional
     load_planned_reason_codes,   # NEW
-    load_shifts_by_date          # NEW
+    load_shifts_by_date,          # NEW
+    load_device_map
 )
+
 from utils import (
     minute_range_to_finalize, to_epoch_ms, floor_to_minute,
     get_site_tz, minute_in_any_shift  # NEW
 )
 # ---- Configuration placeholders ----
-# Map device_id -> line_id (bạn dán danh sách thật vào đây)
-LINE_MAP = {
-    # 'device_uuid': line_id
-    "e5c11cf0-a27f-11f0-aba6-91052cba3a97": 101,
-    "e5cb2f10-a27f-11f0-aba6-91052cba3a97": 102,
-    "e5d4f310-a27f-11f0-aba6-91052cba3a97": 103,
-    "e5dc9430-a27f-11f0-aba6-91052cba3a97": 104,
-    "e5e7ded0-a27f-11f0-aba6-91052cba3a97": 105,
-    "e5ef7f00-a27f-11f0-aba6-91052cba3a97": 106,
-    "e5f880a0-a27f-11f0-aba6-91052cba3a97": 107,
-    "e605c710-a27f-11f0-aba6-91052cba3a97": 108,
-}
+ROOT = Path(__file__).resolve().parents[1]                   # project root: /home/admin/oee-edge
+ENV_PATH = ROOT / ".env"                                     # expected .env path
+load_dotenv(dotenv_path=ENV_PATH)                            # explicit load from root
+print(f"[BOOT] .env loaded from: {ENV_PATH}, exists={ENV_PATH.exists()}")  # quick sanity log
 # Key names in ThingsBoard
-K_PRODUCED = "producedCounterPC"     # cumulative
-K_REJECT   = "rejectCounterPC"       # cumulative (nếu CHƯA có, comment lại)
-K_STATE    = "machineState"          # reason_code (e.g., 9999=RUN)
-K_PO       = "processOrderNr"        # text/string
-K_PACK     = "packaging_id"          # numeric (nếu có)
+K_PRODUCED = os.getenv("KEY_PRODUCED", "producedCounterPC")
+K_REJECT   = os.getenv("KEY_REJECT",   "rejectCounterPC")
+K_STATE    = os.getenv("KEY_STATE",    "machineState")
+K_PO       = os.getenv("KEY_PO",       "processOrderNr")
+K_PACK     = os.getenv("KEY_PACK",     "packaging_id")
+RUN_CODE   = int(os.getenv("RUN_CODE", "9999"))
 
-RUN_CODE = 9999
 
 COUNTER_KEYS = {"good": "good_cum", "ng": "reject_cum"}
 STATE_KEY = "state"  # RUN/STOP/...
@@ -142,87 +136,17 @@ def compute_runtime_sec(state_timeline: List[tuple], minute_start_ms: int) -> in
             run_sec += int((b - a) / 1000)
     return max(0, min(60, run_sec))
 
-# def main():
-#     load_dotenv()
-#     logger.add("logs/etl_minute.log", rotation="10 MB", retention=7, level="INFO")
-
-#     now_utc = datetime.now(timezone.utc)
-#     from_min_utc, to_min_utc = minute_range_to_finalize(now_utc)
-#     logger.info(f"Finalize range (UTC): {from_min_utc} .. {to_min_utc} (exclusive)")
-
-#     # Build minute edges
-#     minute_edges = []
-#     cur = from_min_utc
-#     while cur < to_min_utc:
-#         minute_edges.append(to_epoch_ms(cur))
-#         cur += timedelta(minutes=1)
-
-#     cas = get_cas_session()
-#     pg = get_pg_conn()
-#     pkg_snap = load_packaging_snapshot(pg)
-    
-#     total_rows = 0
-#     try:
-#         for line_id, meta in LINE_MAP.items():
-#             device_id = meta["device_id"]
-#             # Read counters cumulative for window (we read a bit wider: +/- 2 minutes)
-#             ts_from_ms = minute_edges[0] - 120000
-#             ts_to_ms   = minute_edges[-1] + 120000
-
-#             good_series = fetch_cumulative_points(cas, device_id, COUNTER_KEYS["good"], ts_from_ms, ts_to_ms)
-#             ng_series   = fetch_cumulative_points(cas, device_id, COUNTER_KEYS["ng"],   ts_from_ms, ts_to_ms)
-
-#             # Deltas per minute
-#             good_delta = compute_minute_deltas(good_series, minute_edges)
-#             ng_delta   = compute_minute_deltas(ng_series,   minute_edges)
-
-#             # State timeline for runtime calc — ideally you fetch raw changes once for the whole range
-#             state_events = fetch_state_timeline(cas, device_id, ts_from_ms, ts_to_ms)
-
-#             rows = []
-#             for ms in minute_edges:
-#                 ts_min = datetime.fromtimestamp(ms/1000, tz=timezone.utc)
-#                 runtime_sec = compute_runtime_sec(state_events, ms)
-#                 produced = good_delta.get(ms, 0) + ng_delta.get(ms, 0)
-
-#                 # TODO: optionally infer packaging_id/process_order for this minute (from attributes/telemetry/dim join)
-#                 packaging_id = meta.get("packaging_id")
-#                 po = None
-
-#                 rows.append({
-#                     "ts_min": ts_min,
-#                     "line_id": line_id,
-#                     "process_order": po,
-#                     "packaging_id": packaging_id,
-#                     "produced": produced,
-#                     "good": good_delta.get(ms, 0),
-#                     "ng": ng_delta.get(ms, 0),
-#                     "runtime_sec": runtime_sec,
-#                     "planned_sec": DEFAULT_PLANNED_SEC
-#                 })
-
-#             affected = upsert_fact_min(pg, rows)
-#             total_rows += affected
-#             logger.info(f"Line {line_id}: upserted {affected} minute rows")
-
-#     except Exception as e:
-#         logger.exception(f"ETL failed: {e}")
-#         raise
-#     finally:
-#         try:
-#             pg.close()
-#         except Exception:
-#             pass
-#         try:
-#             cas.shutdown()
-#         except Exception:
-#             pass
-
-#     logger.success(f"ETL done. Total rows upserted: {total_rows}")
-
 def main():
     load_dotenv()
-    logger.add("logs/etl_minute.log", rotation="10 MB", retention=7, level="INFO")
+    os.makedirs("logs", exist_ok=True)
+    logger.add(
+        "logs/etl_minute_{time:YYYY-MM-DD}.log",
+        rotation="00:00",
+        retention="7 days",
+        compression="gz",
+        level="INFO",
+        enqueue=True
+    )
 
     DRY_RUN = env_bool("DRY_RUN", True)   # >>> ADD
     if DRY_RUN:
@@ -246,6 +170,8 @@ def main():
     # >>> ADD: PG connection + metadata (kết nối mở suốt vòng chạy)
     pg = get_pg_conn()
     site_tz = get_site_tz()
+    device_map = load_device_map(pg)  # {device_uuid: (line_id, machine_id)}
+    logger.info(f"Loaded {len(device_map)} devices from dim_device.")
     planned_codes = load_planned_reason_codes(pg)
     logger.info(f"Loaded {len(planned_codes)} planned reason codes from PG.")
 
@@ -259,7 +185,7 @@ def main():
         ts_from_ms = minute_edges[0] - 120000
         ts_to_ms   = minute_edges[-1] + 120000
 
-        for dev_id, line_id in LINE_MAP.items():
+        for dev_id, (line_id, machine_id) in device_map.items():
 
             # --- fetch cumulative counters ---
             produced_series = fetch_timeseries_numeric(cas, dev_id, K_PRODUCED, ts_from_ms, ts_to_ms)

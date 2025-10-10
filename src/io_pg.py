@@ -117,3 +117,76 @@ def load_shifts_by_date(conn, start_date: date, end_date: date) -> Dict[date, Li
             d = r["shift_date"]
             by_day.setdefault(d, []).append((r["shift_no"], r["start_time"], r["end_time"]))
     return by_day
+
+def load_reason_lookup(conn) -> Dict[int, Tuple[Optional[int], Optional[int]]]:
+    """
+    Build mapping: reason_code(int) -> (reason_id, state_id)
+    """
+    sql = "SELECT reason_id, state_id, reason_code FROM dim_reason"
+    mp: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql)
+        for r in cur.fetchall():
+            try:
+                code = int(r["reason_code"])
+            except (TypeError, ValueError):
+                continue
+            mp[code] = (r["reason_id"], r["state_id"])
+    return mp
+
+UPSERT_STATE_EVENT = """
+INSERT INTO fact_state_event (
+    line_id, machine_id, state_id, reason_id,
+    start_ts, end_ts, shift_id, po, packaging_id, note
+) VALUES (
+    %(line_id)s, %(machine_id)s, %(state_id)s, %(reason_id)s,
+    %(start_ts)s, %(end_ts)s, %(shift_id)s, %(po)s, %(packaging_id)s, %(note)s
+)
+ON CONFLICT (line_id, start_ts)
+DO UPDATE SET
+    end_ts       = GREATEST(fact_state_event.end_ts, EXCLUDED.end_ts),
+    state_id     = COALESCE(EXCLUDED.state_id, fact_state_event.state_id),
+    reason_id    = COALESCE(EXCLUDED.reason_id, fact_state_event.reason_id),
+    po           = COALESCE(EXCLUDED.po, fact_state_event.po),
+    packaging_id = COALESCE(EXCLUDED.packaging_id, fact_state_event.packaging_id),
+    note         = COALESCE(EXCLUDED.note, fact_state_event.note);
+"""
+
+def upsert_state_event_batch(conn, rows: List[Dict[str, Any]]) -> int:
+    """
+    Upsert a batch of state event rows using UNIQUE(line_id, start_ts).
+    """
+    if not rows:
+        return 0
+    with conn.cursor() as cur:
+        cur.executemany(UPSERT_STATE_EVENT, rows)
+    return len(rows)
+
+def load_device_map(conn) -> Dict[str, Tuple[int, int | None]]:
+    """
+    Load TB device mapping: {device_uuid(str): (line_id, machine_id or None)}
+    """
+    sql = "SELECT device_id::text AS device_id, line_id, machine_id FROM dim_device"
+    mapping: Dict[str, Tuple[int, int | None]] = {}
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql)
+        for r in cur.fetchall():
+            mapping[r["device_id"]] = (int(r["line_id"]), r["machine_id"])
+    return mapping
+
+# --- NEW: get last end_ts for a line_id (for backfill bootstrap)
+def get_last_event_end_ts(conn, line_id: int):
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(end_ts) FROM fact_state_event WHERE line_id=%s", (line_id,))
+        row = cur.fetchone()
+        return row[0]  # may be None
+
+def load_states(conn):
+    """Return list of dicts: [{'state_id': 1, 'state_code': 'RUN'}, ...]"""
+    sql = "SELECT state_id, state_code FROM dim_state;"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()               # rows: list of tuples
+    return [{'state_id': r[0], 'state_code': r[1]} for r in rows]
+
+

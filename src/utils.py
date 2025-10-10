@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone, time, date
 import pytz
 import os
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 def floor_to_minute(dt_utc: datetime) -> datetime:
     """Return dt floored to :00 seconds in UTC."""
@@ -60,3 +60,37 @@ def minute_in_any_shift(local_minute_start: datetime,
         return False
 
     return in_windows(local_minute_start, shifts_today) or in_windows(local_minute_start - timedelta(days=1), shifts_prev)
+
+def resolve_shift(local_dt: datetime,
+                  shifts_today: List[Tuple[int, str, str]],
+                  shifts_prev:  List[Tuple[int, str, str]]) -> Optional[Tuple[str, int, int]]:
+    """
+    Return (shift_date_str 'YYYY-MM-DD', shift_no, shift_id_int) if local_dt belongs to any shift window,
+    else None. Handles wrap-midnight by checking previous day's windows too.
+    shift_id = yyyymmdd*10 + shift_no
+    """
+    def parse_hms(hms: str):
+        hh, mm, ss = map(int, hms.split(":"))
+        return hh, mm, ss
+
+    def find_in_windows(ref_dt: datetime, windows):
+        for no, st, en in windows:
+            hh1, mm1, ss1 = parse_hms(st)
+            hh2, mm2, ss2 = parse_hms(en)
+            start_dt = ref_dt.replace(hour=hh1, minute=mm1, second=ss1, microsecond=0)
+            end_dt   = ref_dt.replace(hour=hh2, minute=mm2, second=ss2, microsecond=0)
+            if (hh2, mm2, ss2) <= (hh1, mm1, ss1):
+                end_dt = end_dt + timedelta(days=1)
+            if start_dt <= ref_dt < end_dt:
+                d = start_dt.date().isoformat()
+                yyyymmdd = int(start_dt.strftime("%Y%m%d"))
+                return d, no, yyyymmdd*10 + int(no)
+        return None
+
+    # Try today
+    hit = find_in_windows(local_dt, shifts_today)
+    if hit:
+        return hit
+    # Try wrap from yesterday
+    hit = find_in_windows(local_dt - timedelta(days=1), shifts_prev)
+    return hit

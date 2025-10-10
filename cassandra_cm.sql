@@ -2,17 +2,17 @@ USE thingsboard;
 SELECT partition
 FROM ts_kv_partitions_cf
 WHERE entity_type = 'DEVICE'
-  AND entity_id   = e54f31a0-a2f7-11ef-8f0c-...UUID...
-  AND key         = 'ProdCount'
+  AND entity_id   = e5e7ded0-a27f-11f0-aba6-91052cba3a97
+  AND key         = 'machineState'
 ORDER BY partition DESC;
-SELECT ts, long_v
+SELECT *
 FROM ts_kv_cf
 WHERE entity_type='DEVICE'
-  AND entity_id = e54f31a0-a2f7-11ef-8f0c-...UUID...
-  AND key = 'ProdCount'
+  AND entity_id = e5e7ded0-a27f-11f0-aba6-91052cba3a97
+  AND key = 'watchDog' -- watchDog machineState
   AND partition = 1759276800000     -- thay bằng giá trị ở bước 2.2
 ORDER BY ts DESC
-LIMIT 20;
+LIMIT 1000;
 SELECT ts, long_v
 FROM ts_kv_cf
 WHERE entity_type='DEVICE'
