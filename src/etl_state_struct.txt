@@ -1,0 +1,210 @@
+-- Active: 1760120419218@@127.0.0.1@5432@tb_edge
+STEP-00 — Init logging & context
+
+    Mục tiêu: Bật logger, in phiên bản, PID, môi trường.
+
+    Input: ENV (LOG_LEVEL, DRY_RUN…), đường dẫn log.
+
+    Output: Logger sẵn sàng.
+
+    Hàm: init_logger().
+
+STEP-01 — Detect mode (DRY_RUN / LIVE)
+
+    Mục tiêu: Quyết định có ghi DB hay chỉ log.
+
+    Input: ENV DRY_RUN.
+
+    Output: Cờ dry_run: bool.
+
+    Hàm: env_bool("DRY_RUN", default=False).
+
+STEP-02 — Load config (config-first)
+
+    Mục tiêu: Đọc YAML/TOML/ENV → object cấu hình hợp lệ.
+
+    Input: config.yaml (Cassandra, Postgres, thời gian, thiết bị…).
+
+    Output: cfg (object).
+
+    Hàm: load_config(), validate_config(cfg).
+
+STEP-03 — Open connections
+
+    Mục tiêu: Mở kết nối cần thiết.
+
+    Input: cfg.cassandra, cfg.postgres.
+
+    Output: cas (Cassandra session), pg (Postgres conn/pool).
+
+    Hàm: get_cas_session(cfg), get_pg_conn(cfg).
+
+STEP-04 — Load static lookups (one-shot)
+
+    Mục tiêu: Lấy map thiết bị & danh mục trạng thái/lý do.
+
+    Input: PG: dim_state, dim_reason, (tùy) dim_device.
+
+    Output: state_lookup, reason_lookup, device_map.
+
+    Hàm: load_states(pg), load_reasons(pg), load_device_map(pg).
+
+STEP-05 — Compute global timebox (now/to_local) & shifts
+
+    Mục tiêu: Xác định biên thời gian chung cho lần chạy.
+
+    Input: cfg.timezone, cfg.lookback_h, cfg.now?.
+
+    Output: now_utc, from_local, to_local, shifts_by_day.
+
+    Hàm: site_clock(cfg), load_shifts_by_date(pg, from_local, to_local).
+
+STEP-06 — Per-device window (watermark)
+
+    Mục tiêu: Ra from_min_utc/to_min_utc riêng cho từng device.
+
+    Input: PG: event cuối cùng; tham số OVERLAP_MIN, MAX_BACKFILL_H.
+
+    Output: win = {device_id: (from_min_utc, to_min_utc)}.
+
+    Hàm: get_last_event_end_ts(pg, device_id),
+    compute_from_to(last_end, hard_from, hard_to, overlap_min, max_backfill_h).
+
+STEP-07 — Read raw from Cassandra (time-partitioned)
+
+    Mục tiêu: Lấy các điểm thô cần thiết theo window/device.
+
+    Input: cas, device_id, win[device], danh sách tag.
+
+    Output: df_raw (ts, key, num_v/str_v/quality…).
+
+    Hàm: partitions_between(device, ts_from, ts_to),
+    read_timeseries(cas, device, keys, ts_from, ts_to).
+
+STEP-08 — Derive logical state points
+
+    Mục tiêu: Từ raw → điểm trạng thái chuẩn hoá theo rule.
+
+    Rule chính:
+
+    OFFLINE nếu số = NULL và str_v chứa “Bad status”, vượt OFFLINE_GRACE_SEC.
+
+    RUN/STOP/IDLE/MAINT theo rule đã chốt (counter, machine_state, order…).
+
+    Output: df_points(device, ts_utc, state_code, reason_code?).
+
+    Hàm: derive_state_points(df_raw, cfg, state_lookup, reason_lookup).
+
+STEP-09 — Compress points → events (run-length)
+
+    Mục tiêu: Gộp các điểm cùng state thành event liên tục; trim biên.
+
+    Input: df_points, win[device], DEBOUNCE_MS?.
+
+    Output: df_events(start_ts, end_ts, state_code, reason_code).
+
+    Hàm: compress_state_series(df_points, debounce_ms, win_bounds).
+
+STEP-10 — Merge with history (overlap & extend)
+
+    Mục tiêu: Xử lý sự chồng lấn với event cuối đã lưu.
+
+    Input: last_event(device), df_events.
+
+    Output: df_events_clean (không trùng, nối đuôi hợp lệ).
+
+    Hàm: merge_with_history(last_event, df_events).
+
+STEP-11 — Build idempotent keys & batches
+
+    Mục tiêu: Tạo hash_key = sha1(device|start|state|reason); chia batch.
+
+    Input: df_events_clean.
+
+    Output: df_upserts có đủ cột để ghi.
+
+    Hàm: attach_hash(df_events_clean), make_batches(df_upserts, size).
+
+STEP-12 — Upsert to PostgreSQL (idempotent)
+
+    Mục tiêu: Ghi dữ liệu (hoặc bỏ qua nếu DRY_RUN).
+
+    Input: pg, df_upserts, dry_run.
+
+    Output: Số row upsert, log chi tiết.
+
+    Hàm: upsert_events(pg, batch, dry_run) (ON CONFLICT hash_key DO UPDATE end_ts, updated_at).
+
+STEP-13 — Late-arriving adjustments (optional)
+
+    Mục tiêu: Cho phép cập nhật biên event khi dữ liệu đến trễ.
+
+    Input: Event mới trùng hash_key hoặc chồng lấn event khác.
+
+    Output: Event được extend/split hợp lệ, cảnh báo nếu vượt ngưỡng thời gian.
+
+    Hàm: apply_late_data_policies(pg, df_upserts, policy).
+
+STEP-14 — Metrics & audit
+
+    Mục tiêu: Tổng kết hiệu năng và audit batch.
+
+    Input: Counters (points read, events, upserts), timers.
+
+    Output: Log summary, load_batch_id.
+
+    Hàm: emit_metrics(logger, counters, timings).
+
+STEP-15 — Error handling & retry
+
+    Mục tiêu: Bắt ngoại lệ theo khối, retry có backoff cho I/O.
+
+    Input: Exception.
+
+    Output: Log ERROR, exit code phù hợp (systemd thấy được).
+
+    Hàm: with_retry(io_fn, retries, backoff), try/except ở mức device/batch.
+
+STEP-16 — Close & cleanup
+
+    Mục tiêu: Đóng kết nối, flush logger.
+
+    Hàm: close(pg), close(cas), logger.info("ETL done").
+
+STEP-00 → init logger
+
+STEP-01 → đọc DRY_RUN
+
+STEP-02 → load & validate config
+
+STEP-03 → mở cas, pg
+
+STEP-04 → load lookups (state/reason/device)
+
+STEP-05 → tính now_utc, from_local, to_local, shifts_by_day
+
+Loop từng device:
+
+7.1) STEP-06 → from_min_utc/to_min_utc theo watermark
+
+7.2) STEP-07 → đọc raw từ Cassandra
+
+7.3) STEP-08 → derive points
+
+7.4) STEP-09 → compress events
+
+7.5) STEP-10 → merge với lịch sử
+
+7.6) STEP-11 → gắn hash_key, chia batch
+
+7.7) STEP-12 → upsert (skip nếu DRY_RUN)
+
+7.8) STEP-13 → xử lý late-data (nếu bật policy)
+
+7.9) Cập nhật counters & log per-device
+
+STEP-14 → emit metrics tổng
+
+STEP-15 → error handling (nếu có)
+
+STEP-16 → đóng kết nối, kết thúc.

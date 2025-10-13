@@ -1,0 +1,20 @@
+app:
+  # Only job-specific knobs below (no DSN/secret here)
+  timezone: "${SITE_TIMEZONE:-Asia/Ho_Chi_Minh}"   # can still come from ENV
+  lookback_h: 24
+  overlap_min: 3
+  max_backfill_h: 24
+  offline_grace_sec: 30
+  debounce_ms: 1000
+
+domain:
+  tags:
+    machine_state: "machineState"
+    counter: "producedCounterPC"
+    watchdog: "watchDog"      # optional
+    status_str: "status"      # where "Bad status" appears
+    po : "processOrderNr"
+    reset : "bCm_ResetCounterPC"
+  devices:
+    - "L105_Filler"
+    - "L105_Packer"

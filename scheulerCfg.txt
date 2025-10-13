@@ -91,3 +91,19 @@ SELECT line_id, state_id, reason_id, start_ts, end_ts, duration_sec
 FROM fact_state_event
 ORDER BY start_ts DESC
 LIMIT 20;
+
+# reload units
+sudo systemctl daemon-reload
+
+# (re)enable + start timer
+sudo systemctl enable --now oee-state.timer
+
+# check timer & next run
+sudo systemctl status oee-state.timer
+sudo systemctl list-timers | grep oee-state
+
+# test service once manually (uses venv)
+sudo systemctl start oee-state.service
+sudo systemctl status oee-state.service
+sudo journalctl -u oee-state.service -n 200 --no-pager
+sudo journalctl -xeu oee-state.timer -u oee-state.service

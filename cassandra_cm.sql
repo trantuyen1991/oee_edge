@@ -1,18 +1,53 @@
+-- Active: 1759913719126@@127.0.0.1@9042@thingsboard
 USE thingsboard;
 SELECT partition
 FROM ts_kv_partitions_cf
 WHERE entity_type = 'DEVICE'
   AND entity_id   = e5e7ded0-a27f-11f0-aba6-91052cba3a97
   AND key         = 'machineState'
-ORDER BY partition DESC;
+  AND partition <= 1759276800000
+  AND partition >= 1759276800000 
+  ALLOW FILTERING;
+--ORDER BY partition DESC ALLOW FILTERING;
+
+SELECT partition
+FROM ts_kv_partitions_cf
+WHERE entity_type = 'DEVICE'
+  AND entity_id = e5e7ded0-a27f-11f0-aba6-91052cba3a97
+ORDER BY partition DESC
+LIMIT 20 ALLOW FILTERING;
+
+
+-- Xem thử có key nào trong partition
+SELECT key, ts FROM ts_kv_cf
+WHERE entity_type='DEVICE' AND entity_id= e5e7ded0-a27f-11f0-aba6-91052cba3a97
+  AND partition= 1759276800000
+  AND ts >= 1760110560000 AND ts < 1760196960000
+LIMIT 50 ALLOW FILTERING;
+
+-- Lấy mẫu 1 key cụ thể
+SELECT ts, bool_v, str_v, long_v, dbl_v FROM ts_kv_cf
+WHERE entity_type='DEVICE' AND entity_id= e5e7ded0-a27f-11f0-aba6-91052cba3a97 AND key='machineState'
+  AND partition=1759276800000
+  AND ts >= 1760110560000 AND ts < 1760196960000
+LIMIT 50 ALLOW FILTERING;
+
 SELECT *
 FROM ts_kv_cf
 WHERE entity_type='DEVICE'
   AND entity_id = e5e7ded0-a27f-11f0-aba6-91052cba3a97
-  AND key = 'watchDog' -- watchDog machineState
+  AND key = 'machineState' -- watchDog machineState
   AND partition = 1759276800000     -- thay bằng giá trị ở bước 2.2
 ORDER BY ts DESC
-LIMIT 1000;
+LIMIT 20;
+
+SELECT partition, ts, long_v, str_v 
+FROM ts_kv_cf
+WHERE entity_id = e5e7ded0-a27f-11f0-aba6-91052cba3a97 
+  AND key = 'machineState'
+  AND partition = 1759276800000
+LIMIT 5 ALLOW FILTERING;
+
 SELECT ts, long_v
 FROM ts_kv_cf
 WHERE entity_type='DEVICE'

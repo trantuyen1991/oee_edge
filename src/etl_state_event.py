@@ -15,7 +15,13 @@ from typing import Dict, Any, List, Tuple, Optional
 from dotenv import load_dotenv
 from loguru import logger
 
-from io_cas import get_cas_session, fetch_timeseries_numeric, fetch_timeseries_text
+from io_cas import (
+    get_cas_session, 
+    fetch_timeseries_numeric, 
+    fetch_timeseries_text,
+    fetch_state_with_quality,
+    get_partitions
+    )
 from io_pg import (
     get_pg_conn,
     load_reason_lookup,          # NEW (you'll add this function below)
@@ -56,304 +62,10 @@ UNKNOWN_REASON_ID = int(os.getenv("UNKNOWN_REASON_ID", "999000"))
 UNKNOWN_STATE_ID  = int(os.getenv("UNKNOWN_STATE_ID",  "0"))
 UNKNOWN_REASON_CODE = os.getenv("UNKNOWN_REASON_CODE", "-1")
 
-def backfill_windows(pg, site_tz):
-    block = int(os.getenv("EVENT_BLOCK_MIN","30"))
-    lookback_h = int(os.getenv("BACKFILL_LOOKBACK_HOURS","24"))
-    watermark = int(os.getenv("WATERMARK_SEC","120"))
-
-    now = datetime.now(timezone.utc)
-    hard_to = floor_to_minute(now - timedelta(seconds=watermark))
-
-    # build danh sách (dev_id -> start_from)
-    starts: Dict[str, datetime] = {}
-    with pg.cursor() as cur:
-        for dev_id, (line_id, _) in device_map.items():
-            cur.execute("SELECT MAX(end_ts) FROM fact_state_event WHERE line_id=%s", (line_id,))
-            row = cur.fetchone()
-            last_end = row[0]
-            if last_end is None:
-                starts[dev_id] = hard_to - timedelta(hours=lookback_h)
-            else:
-                starts[dev_id] = last_end - timedelta(minutes=5)  # overlap 5'
-    # sinh các block
-    sched = []
-    for dev_id, start in starts.items():
-        s = floor_to_minute(start)
-        while s < hard_to:
-            e = min(s + timedelta(minutes=block), hard_to)
-            sched.append((dev_id, s, e))
-            s = e
-    return sched
-
-def env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
-
-def minute_window_for_events(now_utc: datetime) -> Tuple[datetime, datetime]:
-    """
-    Event job window:
-      - Watermark: finalize until N-120s (same principle as minute job)
-      - Process last 5 minutes (overlap) to be idempotent & handle late data
-    """
-    watermark_sec = int(os.getenv("WATERMARK_SEC", "120"))
-    back_minutes  = int(os.getenv("EVENT_BACK_MIN", "5"))
-
-    last_ok = floor_to_minute(now_utc - timedelta(seconds=watermark_sec))
-    from_min = last_ok - timedelta(minutes=back_minutes - 1)
-    to_min = last_ok + timedelta(minutes=1)
-    return from_min, to_min
-
-def compress_state_series(series: List[Tuple[int, int]],
-                          start_ms: int,
-                          end_ms:   int) -> List[Tuple[int, int, int]]:
-    """
-    Compress raw points (ts_ms, code) into non-overlapping segments within [start_ms, end_ms).
-    Returns: list of (seg_start_ms, seg_end_ms, code)
-    - If first point is after start_ms, assume its code holds from start_ms
-    - If no data, returns []
-    """
-    if not series:
-        return []
-
-    ser = sorted(series, key=lambda x: x[0])
-    # Ensure first at window start
-    if ser[0][0] > start_ms:
-        ser = [(start_ms, ser[0][1])] + ser
-    # Append end sentinel
-    if ser[-1][0] < end_ms:
-        ser.append((end_ms, ser[-1][1]))
-
-    segs: List[Tuple[int, int, int]] = []
-    for i in range(len(ser) - 1):
-        a_ts, a_code = ser[i]
-        b_ts, _      = ser[i + 1]
-        # intersect with window
-        s = max(a_ts, start_ms)
-        e = min(b_ts, end_ms)
-        if e > s:
-            if segs and segs[-1][2] == a_code and segs[-1][1] == s:
-                # merge contiguous same-code
-                segs[-1] = (segs[-1][0], e, a_code)
-            else:
-                segs.append((s, e, a_code))
-    return segs
-
-# --- NEW: Build online/offline windows from watchdog or state points
-# def build_online_windows(state_series: List[Tuple[int,int]],
-#                          wd_points: List[Tuple[int,float]],
-#                          s_ms: int, e_ms: int) -> List[Tuple[int,int,bool]]:
-#     """
-#     Trả về list (win_start_ms, win_end_ms, is_online) trong [s_ms,e_ms).
-#     Logic: nếu không thấy mốc nào trong > OFFLINE_GRACE_SEC => offline.
-#     Ưu tiên watchdog; nếu watchdog trống thì fallback dùng state_series.
-#     """
-#     grace = OFFLINE_GRACE_SEC * 1000
-#     marks = sorted(ts for ts,_ in wd_points) if wd_points else sorted(ts for ts,_ in state_series)
-#     if not marks:
-#         return [(s_ms, e_ms, False)]
-#     # giữ các dấu mốc nằm trong khoảng
-#     marks = [t for t in marks if s_ms <= t <= e_ms]
-#     if not marks:
-#         return [(s_ms, e_ms, False)]
-#     out = []
-#     # đoạn trước mốc đầu tiên
-#     if marks[0] > s_ms:
-#         out.append((s_ms, marks[0], False))
-#     # giữa các mốc
-#     for i in range(len(marks)-1):
-#         a, b = marks[i], marks[i+1]
-#         if b - a > grace:
-#             out.append((a, a+grace, True))
-#             out.append((a+grace, b, False))
-#         else:
-#             out.append((a, b, True))
-#     # đoạn sau mốc cuối
-#     last = marks[-1]
-#     if e_ms - last > grace:
-#         out.append((last, last+grace, True))
-#         out.append((last+grace, e_ms, False))
-#     else:
-#         out.append((last, e_ms, True))
-#     # gộp kề nhau
-#     merged = []
-#     for s,e,fl in out:
-#         if not merged: merged.append((s,e,fl)); continue
-#         ps,pe,pf = merged[-1]
-#         if pf==fl and s<=pe:
-#             merged[-1] = (ps, max(pe,e), pf)
-#         else:
-#             merged.append((s,e,fl))
-#     return [(max(s_ms,s), min(e_ms,e), fl) for s,e,fl in merged if min(e_ms,e) > max(s_ms,s)]
-
-def build_online_windows(state_series, wd_points, s_ms, e_ms):
-    """
-    Trả về danh sách (start_ms, end_ms, is_online).
-
-    FIX: Không tạo các đoạn offline "ảo" ở rìa block.
-    Quy ước:
-      - Dùng watchdog (wd_points) làm mốc; nếu không có thì fallback sang state_series.
-      - Nếu không có dữ liệu trong cả block -> coi offline toàn block.
-      - Giữa hai mốc liên tiếp: nếu khoảng cách > grace => tách thành (online grace) + (offline phần còn lại).
-      - Đầu/đuôi block: LUÔN nối với trạng thái online nếu trong block có dữ liệu.
-    """
-    grace = OFFLINE_GRACE_SEC * 1000  # ví dụ 30s -> 30000ms
-
-    # Lấy danh sách mốc thời gian từ watchdog trước; nếu không có thì dùng state_series
-    if wd_points:
-        marks = sorted(ts for ts, _ in wd_points)
-    else:
-        marks = sorted(ts for ts, _ in state_series)
-
-    # Không có mốc nào -> offline toàn block
-    if not marks:
-        return [(s_ms, e_ms, False)]
-
-    # Giữ các mốc nằm TRONG block
-    marks = [t for t in marks if s_ms <= t <= e_ms]
-    if not marks:
-        return [(s_ms, e_ms, False)]
-
-    out = []
-
-    # Tạo các đoạn giữa các mốc liên tiếp
-    for i in range(len(marks) - 1):
-        a, b = marks[i], marks[i + 1]
-        if b - a > grace:
-            # phần đầu coi online (đến hết grace)
-            out.append((a, a + grace, True))
-            # phần sau là offline
-            out.append((a + grace, b, False))
-        else:
-            # cả đoạn coi online
-            out.append((a, b, True))
-
-    # --- FIX: không tạo offline ảo ở rìa block ---
-    # Nếu có dữ liệu trong block, đầu & cuối block nối online.
-    if out and out[0][0] > s_ms:
-        out.insert(0, (s_ms, out[0][0], True))
-    if out and out[-1][1] < e_ms:
-        out.append((out[-1][1], e_ms, True))
-
-    # Gộp các đoạn kề nhau cùng trạng thái
-    merged = []
-    for s, e, on in out:
-        if not merged:
-            merged.append((s, e, on))
-            continue
-        ps, pe, pon = merged[-1]
-        if pon == on and s <= pe:
-            merged[-1] = (ps, max(pe, e), pon)
-        else:
-            merged.append((s, e, on))
-
-    return merged
-
-
-def choose_latest_before(ms: int, points: List[Tuple[int, Any]]) -> Optional[Any]:
-    """
-    Given points [(ts_ms, val)...], pick the latest val where ts_ms <= ms.
-    """
-    for ts, val in reversed(sorted(points, key=lambda x: x[0])):
-        if ts <= ms:
-            return val
-    return None
-
-def process_one_device_window(dev_id: str,
-                              line_id: int,
-                              machine_id: Optional[int],
-                              from_min_utc: datetime,
-                              to_min_utc: datetime,
-                              cas, pg, site_tz, reason_lookup, shifts_by_day, DRY_RUN, state_lookup) -> int:
-    """Return number of rows upserted."""
-    start_ms = to_epoch_ms(from_min_utc)
-    end_ms   = to_epoch_ms(to_min_utc)
-
-    # 1) read machineState for window
-    state_points = fetch_timeseries_numeric(cas, dev_id, ENTITY_KEY_STATE, start_ms-120000, end_ms+120000)
-    state_series = [(ts, int(v)) for ts, v in state_points]
-    if not state_series:
-        logger.info(f"[LINE {line_id}] no state points in window -> skip")
-        return 0 , 0
-    
-    # (optional) read context
-    wd_points    = fetch_timeseries_numeric(cas, dev_id, ENTITY_KEY_WD,   start_ms-120000, end_ms+120000)
-    po_points    = fetch_timeseries_text(  cas, dev_id, ENTITY_KEY_PO,   start_ms-120000, end_ms+120000)
-    pack_points  = fetch_timeseries_numeric(cas, dev_id, ENTITY_KEY_PACK,start_ms-120000, end_ms+120000)
-    note         = None
-    # 2) compress into segments
-    segs = compress_state_series(state_series, start_ms, end_ms)
-    online_windows = build_online_windows(state_series, wd_points, start_ms, end_ms)
-
-    def intersect(a1,a2,b1,b2):
-        s = max(a1,b1); e = min(a2,b2)
-        return (s,e) if e > s else None
-    # 3) build rows for upsert
-    rows = []
-    
-    for s_ms, e_ms, code in segs:
-        for ow_s, ow_e, is_on in online_windows:
-            inter = intersect(s_ms, e_ms, ow_s, ow_e)
-            if not inter: continue
-            seg_s, seg_e = inter
-
-            eff_code = code if is_on else COMM_LOSS_CODE
-            start_ts = datetime.fromtimestamp(seg_s/1000, tz=timezone.utc)
-            end_ts   = datetime.fromtimestamp(seg_e/1000, tz=timezone.utc)
-
-            start_local = start_ts.astimezone(site_tz)
-            shifts_today = shifts_by_day.get(start_local.date(), [])
-            shifts_prev  = shifts_by_day.get(start_local.date() - timedelta(days=1), [])
-            shift_tuple  = resolve_shift(start_local, shifts_today, shifts_prev)  # (date_str, no, shift_id) or None
-            shift_id     = shift_tuple[2] if shift_tuple else None
-
-            po = choose_latest_before(seg_s, po_points) if po_points else None
-            packaging_id = choose_latest_before(seg_s, pack_points) if pack_points else None
-            try: packaging_id = int(packaging_id) if packaging_id is not None else None
-            except: packaging_id = None
-            
-            reason_id, state_id = reason_lookup.get(eff_code, (None, None))
-            if reason_id is None or state_id is None:
-                reason_id = UNKNOWN_REASON_ID
-                state_id = UNKNOWN_STATE_ID
-                note = f"UNKNOWN reason_code={eff_code}"
-                logger.warning(f"[LINE {line_id}] missing mapping for reason_code={eff_code} -> fallback to "
-                            f"(reason_id={UNKNOWN_REASON_ID}, state_id={UNKNOWN_STATE_ID})")
-
-            # --- Resolve state_code from dim_state for logging/note ---
-            state_code = state_lookup.get(state_id, "UNKNOWN")
-
-            note_text = note or ""
-            note_text = f"{state_code} ({note_text})" if note_text else state_code
-
-            rows.append({
-                "line_id": line_id,
-                "machine_id": machine_id,
-                "state_id": state_id,
-                "reason_id": reason_id,
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-                "shift_id": shift_id,
-                "po": po,
-                "packaging_id": packaging_id,
-                "note": note_text
-            })
-            
-    if not rows:
-        return 0, len(segs)
-    if DRY_RUN:
-        for r in rows:
-            logger.info(f"[LINE {line_id}] {r['start_ts'].isoformat()} -> {r['end_ts'].isoformat()} "
-                        f"reason={r['reason_id']} state={r['state_id']} shift_id={r['shift_id']}")
-        return 0 , len(segs)
-    affected = upsert_state_event_batch(pg, rows)
-    return affected, len(segs)
-
 def main():
+    # STEP-00 — Init logging & context
     load_dotenv()
     os.makedirs("logs", exist_ok=True)
-    # logger.add("logs/etl_state_event.log", rotation="10 MB", retention=7, level="INFO")
     logger.add(
         "logs/etl_state_event_{time:YYYY-MM-DD}.log",  # hoặc etl_minute_{time:YYYY-MM-DD}.log
         rotation="00:00",       # tách file mỗi ngày lúc 00:00 (theo local time)
@@ -362,13 +74,13 @@ def main():
         level="INFO",
         enqueue=True            # an toàn khi chạy qua systemd / multi-thread
     )
-
-    DRY_RUN = env_bool("DRY_RUN", False)  # default ghi DB, đổi true nếu muốn chỉ log
+    # ----STEP-01------------ SELECT LOG-MODE ----------------
+    DRY_RUN = env_bool("DRY_RUN", False)  
     if DRY_RUN:
         logger.info("DRY_RUN=True -> only logging (no DB writes)")
     else:
         logger.info("DRY_RUN=False -> UPSERT fact_state_event enabled")
-
+     # ----STEP-02------------ GET PARAMETER ----------------
     now_utc = datetime.now(timezone.utc)
     site_tz = get_site_tz()
     cas = get_cas_session()
@@ -386,32 +98,116 @@ def main():
     total_upserts  = 0
 
     try:
+        # ---------------- BACKFILL ON START (gọn – chuẩn UTC) ----------------
         if BACKFILL_ON_START:
-            logger.info(f"Backfill enabled: lookback={BACKFILL_LOOKBACK_HOURS}h, block={EVENT_BLOCK_MIN}min")
-            watermark = int(os.getenv("WATERMARK_SEC","120"))
-            hard_to   = floor_to_minute(now_utc - timedelta(seconds=watermark))
-            for dev_id, (line_id, machine_id) in device_map.items():
-                last_end = get_last_event_end_ts(pg, line_id)
-                if last_end is None:
-                    start_from = hard_to - timedelta(hours=BACKFILL_LOOKBACK_HOURS)
-                else:
-                    start_from = floor_to_minute(last_end - timedelta(minutes=5))  # overlap 5'
+            # 1) Thời gian chuẩn UTC
+            watermark = int(os.getenv("WATERMARK_SEC", "120"))               # lag để tránh dữ liệu đang đến
+            hard_to  = datetime.utcnow().replace(tzinfo=timezone.utc)        # luôn UTC aware
+            # hard_to  = floor_to_minute(now_utc - timedelta(seconds=watermark))
 
-                s = start_from
-                while s < hard_to:
-                    e = min(s + timedelta(minutes=EVENT_BLOCK_MIN), hard_to)
-                    up , total_segments = process_one_device_window(dev_id, line_id, machine_id, s, e,
-                                                   cas, pg, site_tz, reason_lookup, shifts_by_day, DRY_RUN, state_lookup)
-                    total_upserts += up
-                    logger.info(f"[LINE {line_id}] backfill block {s}..{e} -> upserts={up}")
-                    s = e
-        else:
-            # window ngắn như trước
-            from_min_utc, to_min_utc = minute_window_for_events(now_utc)
+            logger.info(f"Backfill enabled: lookback={BACKFILL_LOOKBACK_HOURS}h, watermark={watermark}s "
+                        f"(UTC hard_to={hard_to}, Local hard_to={hard_to.astimezone(site_tz)})")
+
+            # 2) Tiện ích chuyển về naive-UTC khi nói chuyện với Postgres (timestamp without time zone)
+            def to_naive_utc(dt: datetime) -> datetime:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+
+            total_segments = 0
+            total_upserts  = 0
+
+            # 3) Quét từng device/line
             for dev_id, (line_id, machine_id) in device_map.items():
-                up, total_segments  = process_one_device_window(dev_id, line_id, machine_id, from_min_utc, to_min_utc,
-                                               cas, pg, site_tz, reason_lookup, shifts_by_day, DRY_RUN, state_lookup)
+                # 3.1) Lấy mốc cuối cùng đã ghi trong DB (naive → hiểu là UTC)
+                last_end = get_last_event_end_ts(pg, line_id)  # có thể None
+                if last_end is not None:
+                    # chuẩn hóa thành UTC aware và kẹp không vượt hard_to
+                    last_end_utc = (last_end.replace(tzinfo=timezone.utc)
+                                    if last_end.tzinfo is None else last_end.astimezone(timezone.utc))
+                    last_end_utc = min(last_end_utc, hard_to)
+                else:
+                    last_end_utc = None
+
+                # 3.2) Xác định from/to cho backfill
+                #    - Nếu chưa từng có dữ liệu → backfill full lookback 48h
+                #    - Nếu đã có → backfill từ (last_end - 5 phút) đến hard_to để bù trễ/ngắt quãng
+                # if last_end_utc is None:
+                start_from = hard_to - timedelta(hours=BACKFILL_LOOKBACK_HOURS)
+                # else:
+                #     start_from = floor_to_minute(last_end_utc - timedelta(minutes=5))  # overlap nhẹ
+
+                # Guard: nếu vì lý do nào đó from >= to (ngược), kéo lùi 1h cho an toàn
+                if start_from >= hard_to:
+                    logger.warning(f"[LINE {line_id}] start_from >= hard_to ({start_from} >= {hard_to}) → adjust by -1h")
+                    start_from = floor_to_minute(hard_to - timedelta(hours=1))
+
+                # Log song song UTC & Local để dễ so sánh với UI
+                logger.info(
+                    f"[LINE {line_id}] Backfill window: "
+                    f"UTC {start_from} → {hard_to} | "
+                    f"Local {start_from.astimezone(site_tz)} → {hard_to.astimezone(site_tz)}"
+                )
+
+                # 3.3) Dọn chồng chéo trong khoảng [start_from, hard_to) trước khi insert lại
+                if not DRY_RUN:
+                    delete_pg(pg, line_id, start_from, hard_to, site_tz)
+                # 3.4) Xử lý 1 phát toàn cửa sổ (không chia block)
+                up, segs = process_one_device_window(
+                    dev_id, line_id, machine_id,
+                    from_min_utc=start_from,
+                    to_min_utc=hard_to,
+                    cas=cas, pg=pg, site_tz=site_tz,
+                    reason_lookup=reason_lookup, shifts_by_day=shifts_by_day,
+                    DRY_RUN=DRY_RUN, state_lookup=state_lookup
+                )
+                total_upserts  += up
+                total_segments += segs
+
+            logger.info(f"Backfill done. Segments={total_segments}, Upserts={total_upserts}, DRY_RUN={DRY_RUN}")
+            return
+        # ---------------- END BACKFILL ON START ----------------
+        else:
+            # ----- STREAMING WINDOW (per-line), không dùng minute_window_for_events -----
+            watermark_sec = int(os.getenv("WATERMARK_SEC", "120"))
+            overlap_min   = int(os.getenv("EVENT_BACK_MIN", "5"))  # 5–6 phút là hợp lý
+
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            hard_to = floor_to_minute(now_utc - timedelta(seconds=watermark_sec))  # mốc chốt dữ liệu an toàn
+
+            total_segments = 0
+            for dev_id, (line_id, machine_id) in device_map.items():
+                # 1) lấy event cuối trước hard_to để quyết định from_min_utc
+                # last_end = get_last_event_end_ts(pg, line_id)  # naive (UTC)
+                last_end = get_last_event_end_ts_v1(pg, line_id, site_tz, hard_to)  # mới
+                logger.debug(f"get_last_event_end_ts: last_end {last_end}")
+                if last_end:
+                    last_end_utc = (last_end.replace(tzinfo=timezone.utc)
+                                    if last_end.tzinfo is None else last_end.astimezone(timezone.utc))
+                    last_end_utc = min(last_end_utc, hard_to)
+                    from_min_utc = floor_to_minute(last_end_utc - timedelta(minutes=overlap_min))
+                else:
+                    # lần đầu chưa có dữ liệu: lấy lookback rộng (ví dụ 48h) để dựng liên tục
+                    lookback_h = int(os.getenv("BACKFILL_LOOKBACK_HOURS", "48"))
+                    from_min_utc = hard_to - timedelta(hours=lookback_h)
+
+                # Guard nếu lỡ ngược
+                if from_min_utc >= hard_to:
+                    from_min_utc = floor_to_minute(hard_to - timedelta(minutes=overlap_min))
+
+                # 2) XÓA overlap trước khi ghi (UTC-naive + dọn legacy local-naive)
+                if not DRY_RUN:
+                    delete_pg(pg, line_id, from_min_utc, hard_to, site_tz)
+
+                # 3) Xử lý 1 phát theo cửa sổ đã tính (đã có seed continuity trong process_one_device_window)
+                up, segs = process_one_device_window(
+                    dev_id, line_id, machine_id,
+                    from_min_utc=from_min_utc,
+                    to_min_utc=hard_to,
+                    cas=cas, pg=pg, site_tz=site_tz,
+                    reason_lookup=reason_lookup, shifts_by_day=shifts_by_day,
+                    DRY_RUN=DRY_RUN, state_lookup=state_lookup
+                )
                 total_upserts += up
+                total_segments += segs
 
     except Exception as e:
         logger.exception(f"State event ETL failed: {e}")

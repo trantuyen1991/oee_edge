@@ -5,6 +5,15 @@ import psycopg
 from psycopg.rows import dict_row
 from datetime import date
 
+import logging
+try:
+    # psycopg3 style error (psycopg 3.x)
+    from psycopg.errors import StringDataRightTruncation, DataError as PsyDataError
+except Exception:  # pragma: no cover
+    # psycopg2 fallback (nếu đang dùng psycopg2)
+    from psycopg2.errors import StringDataRightTruncation  # type: ignore
+    from psycopg2 import DataError as PsyDataError  # type: ignore
+
 def get_pg_conn():
     """
     Create a new PostgreSQL connection using env vars.
@@ -152,15 +161,15 @@ DO UPDATE SET
     note         = COALESCE(EXCLUDED.note, fact_state_event.note);
 """
 
-def upsert_state_event_batch(conn, rows: List[Dict[str, Any]]) -> int:
-    """
-    Upsert a batch of state event rows using UNIQUE(line_id, start_ts).
-    """
-    if not rows:
-        return 0
-    with conn.cursor() as cur:
-        cur.executemany(UPSERT_STATE_EVENT, rows)
-    return len(rows)
+# def upsert_state_event_batch(conn, rows: List[Dict[str, Any]]) -> int:
+#     """
+#     Upsert a batch of state event rows using UNIQUE(line_id, start_ts).
+#     """
+#     if not rows:
+#         return 0
+#     with conn.cursor() as cur:
+#         cur.executemany(UPSERT_STATE_EVENT, rows)
+#     return len(rows)
 
 def load_device_map(conn) -> Dict[str, Tuple[int, int | None]]:
     """
@@ -189,4 +198,167 @@ def load_states(conn):
         rows = cur.fetchall()               # rows: list of tuples
     return [{'state_id': r[0], 'state_code': r[1]} for r in rows]
 
+def _get_varchar_limits(conn, table: str) -> Dict[str, Optional[int]]:
+    """
+    Read VARCHAR length limits from information_schema for a given table.
+    Returns {column_name: max_length or None (for TEXT)}.
+    """
+    sql = """
+    SELECT column_name, data_type, character_maximum_length
+    FROM information_schema.columns
+    WHERE table_name = %s
+    """
+    limits: Dict[str, Optional[int]] = {}
+    with conn.cursor() as cur:
+        cur.execute(sql, (table,))
+        for col, dtype, charlen in cur.fetchall():
+            if dtype in ("character varying", "varchar"):
+                limits[col] = int(charlen) if charlen is not None else None
+            elif dtype == "text":
+                limits[col] = None  # no hard limit
+    return limits
 
+
+def _row_len_report(row: Dict[str, Any], limits: Dict[str, Optional[int]]) -> List[str]:
+    """
+    Build a per-column length report for strings vs limits.
+    """
+    report = []
+    for k, v in row.items():
+        if k not in limits:
+            continue
+        maxlen = limits[k]
+        if v is None:
+            continue
+        if isinstance(v, (str, bytes)):
+            length = len(v) if isinstance(v, str) else len(v.decode(errors="ignore"))
+            if (maxlen is not None) and (length > maxlen):
+                report.append(f"{k} length {length} > limit {maxlen} | sample='{str(v)[:120]}'")
+            else:
+                report.append(f"{k} length {length}" + ("" if maxlen is None else f" (limit {maxlen})"))
+    return report
+
+
+def _binary_search_bad_row(conn, rows: List[Dict[str, Any]], logger: logging.Logger) -> Tuple[int, Exception]:
+    """
+    Binary search to find the first offending row that triggers DB error.
+    Returns (index_in_rows, exception).
+    """
+    lo, hi = 0, len(rows) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        # thử insert 1 row tại mid
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(UPSERT_STATE_EVENT, [rows[mid]])
+            conn.rollback()  # rollback test insert
+            # nếu không lỗi -> lỗi nằm ở nửa trên
+            lo = mid + 1
+        except Exception as ex:  # có lỗi -> thu hẹp xuống nửa dưới (bao gồm mid)
+            hi = mid - 1
+            bad_idx = mid
+            bad_ex = ex
+            # nếu dải chỉ còn 1 phần tử
+            if lo > hi:
+                return bad_idx, bad_ex
+    # fallback (không nên xảy ra)
+    return -1, RuntimeError("Unable to isolate bad row")
+
+
+def upsert_state_event_batch(
+    conn,
+    rows: List[Dict[str, Any]],
+    logger: Optional[logging.Logger] = None,
+    *,
+    table_name: str = "fact_state_event",
+    chunk_size: int = 2000,
+    validate_schema: bool = True
+) -> int:
+    """
+    Upsert a batch of state event rows using UNIQUE(line_id, start_ts).
+    - Chunked executemany để dễ cô lập lỗi.
+    - Khi gặp lỗi (ví dụ StringDataRightTruncation), chạy binary-search để tìm row vi phạm
+      rồi log chi tiết: cột nào dài bao nhiêu / giới hạn bao nhiêu, sample giá trị.
+
+    Parameters
+    ----------
+    conn : psycopg connection
+    rows : list of dict
+    logger : logging.Logger
+    table_name : str
+        Tên bảng để truy vấn metadata (giới hạn VARCHAR).
+    chunk_size : int
+        Kích thước lô cho executemany.
+    validate_schema : bool
+        Nếu True, đọc information_schema để thu thập giới hạn VARCHAR và log cảnh báo trước.
+
+    Returns
+    -------
+    int : số row dự kiến upsert (nếu thành công toàn bộ).
+    """
+    if not rows:
+        return 0
+
+    _logger = logger or logging.getLogger(__name__)
+
+    # Đọc giới hạn VARCHAR để hiển thị report khi có lỗi
+    limits: Dict[str, Optional[int]] = {}
+    if validate_schema:
+        try:
+            limits = _get_varchar_limits(conn, table_name)
+            _logger.debug(f"[UPSERT_STATE_EVENT] Loaded column limits for {table_name}: {limits}")
+        except Exception as ex:
+            _logger.warning(f"[UPSERT_STATE_EVENT] Cannot load varchar limits for {table_name}: {ex}")
+            limits = {}
+
+    # Insert theo lô để dễ khoanh vùng lỗi
+    total = 0
+    for i in range(0, len(rows), chunk_size):
+        batch = rows[i:i + chunk_size]
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(UPSERT_STATE_EVENT, batch)
+            total += len(batch)
+        except (StringDataRightTruncation, PsyDataError) as ex:
+            _logger.error(
+                f"[UPSERT_STATE_EVENT] Batch failed at rows[{i}:{i+len(batch)}], size={len(batch)}. "
+                f"Error={type(ex).__name__}: {ex}"
+            )
+            # Cố gắng xác định cụ thể row lỗi bằng binary-search
+            bad_rel_idx, bad_ex = _binary_search_bad_row(conn, batch, _logger)
+            if bad_rel_idx >= 0:
+                bad_abs_idx = i + bad_rel_idx
+                bad_row = batch[bad_rel_idx]
+                _logger.error(f"[UPSERT_STATE_EVENT] Offending row index={bad_abs_idx} (relative={bad_rel_idx})")
+
+                # In báo cáo độ dài từng cột string so với limit
+                if limits:
+                    report = _row_len_report(bad_row, limits)
+                    for line in report:
+                        _logger.error(f"[UPSERT_STATE_EVENT] {line}")
+                else:
+                    # Không có metadata -> in sample các trường string
+                    for k, v in bad_row.items():
+                        if isinstance(v, (str, bytes)):
+                            length = len(v) if isinstance(v, str) else len(v.decode(errors="ignore"))
+                            sample = (v if isinstance(v, str) else v.decode(errors="ignore"))[:120]
+                            _logger.error(f"[UPSERT_STATE_EVENT] {k} length={length} sample='{sample}'")
+
+                # Gợi ý nhanh: nếu có cột 'note' hay 'po'
+                for hint_col in ("note", "po", "reason_code", "state_code"):
+                    if hint_col in bad_row:
+                        val = bad_row[hint_col]
+                        if isinstance(val, (str, bytes)):
+                            s = val if isinstance(val, str) else val.decode(errors="ignore")
+                            _logger.error(f"[UPSERT_STATE_EVENT] hint {hint_col}='{s[:180]}'")
+
+            # Nâng lỗi để caller quyết định rollback/stop
+            raise
+        except Exception as ex:
+            # Bắt mọi lỗi khác để log đàng hoàng
+            _logger.exception(
+                f"[UPSERT_STATE_EVENT] Unexpected error at rows[{i}:{i+len(batch)}], size={len(batch)}: {ex}"
+            )
+            raise
+
+    return total
