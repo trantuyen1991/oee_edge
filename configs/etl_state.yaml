@@ -3,9 +3,16 @@ app:
   timezone: "${SITE_TIMEZONE:-Asia/Ho_Chi_Minh}"   # can still come from ENV
   lookback_h: 24
   overlap_min: 3
-  max_backfill_h: 24
+  max_backfill_h: 720
   offline_grace_sec: 30
   debounce_ms: 1000
+
+etl_state:
+  raw_window_min: 60
+  overlap_min: 5
+  lookback_h: 24
+  min_lookback_h: 1
+  max_lookback_h: 720
 
 domain:
   tags:

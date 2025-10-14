@@ -5,8 +5,9 @@ from typing import Optional, Tuple
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from timebox import floor_to_minute
+import uuid
 
-def get_last_event_end_ts(engine: Engine, machine_id: int) -> Optional[datetime]:
+def get_last_event_end_ts(engine: Engine, device_uuid: uuid.UUID) -> Optional[datetime]:
     """
     Get the latest event end timestamp (UTC) for a given machine.
 
@@ -23,10 +24,10 @@ def get_last_event_end_ts(engine: Engine, machine_id: int) -> Optional[datetime]
     sql = text("""
         SELECT MAX(end_ts) AS last_end_utc     -- get the most recent UTC end_ts
         FROM public.fact_state_event           -- from event fact table
-        WHERE machine_id = :mid                -- for this machine only
+        WHERE device_uuid = :mid                -- for this machine only
     """)
     with engine.connect() as conn:
-        row = conn.execute(sql, {"mid": machine_id}).mappings().first()
+        row = conn.execute(sql, {"mid": device_uuid}).mappings().first()
     return row["last_end_utc"] if row and row["last_end_utc"] else None
 
 def compute_from_to(
@@ -54,6 +55,7 @@ def compute_from_to(
     """
     # 1️⃣  Nếu chưa có event nào → bắt đầu theo lookback global
     if not last_end_utc:
+        hard_from_utc = floor_to_minute(hard_to_utc - timedelta(hours=max_backfill_h))
         return hard_from_utc, hard_to_utc
 
     # 2️⃣  Cắt 3 phút overlap để đọc chồng nhẹ

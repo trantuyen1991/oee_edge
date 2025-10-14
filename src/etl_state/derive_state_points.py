@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import pandas as pd
 from datetime import datetime, timedelta, timezone, date, time
 # import logging
@@ -129,25 +130,41 @@ def ensure_event_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-UNKNOWN_REASON_ID = 999000
-OFFLINE_REASON_ID = 1
+UNKNOWN_REASON_ID = int(os.getenv("UNKNOWN_REASON_ID", "0000"))
+OFFLINE_REASON_ID = int(os.getenv("OFFLINE_REASON_ID", "0"))
+COMM_LOSS_CODE  = int(os.getenv("COMM_LOSS_CODE", "9000"))
 
 def _infer_reason_id(row: Dict[str, Any]) -> int:
     """Infer reason_id based on machineState, watchDog, etc."""
-    if not row.get("watchDog", True):
-        return OFFLINE_REASON_ID
-    if row.get("machineState") is None:
+    rid = row.get("machineState")
+    if rid is None:
         return UNKNOWN_REASON_ID
-    rid = row.get("reason_id")
     if rid is not None:
         try:
-            return int(rid)
+            s = str(rid).strip()
+            if s.lower().startswith("bad"):  # từ TB khi OPC lỗi
+                return  COMM_LOSS_CODE
+            else:
+                return int(rid)
         except (ValueError, TypeError):
             return UNKNOWN_REASON_ID
     try:
-        return int(row.get("machineState"))
+        return int(rid)
     except (ValueError, TypeError):
         return UNKNOWN_REASON_ID
+
+def _infer_packaging_id(row: Dict[str, Any]) -> int | None:
+    """Infer packaging_id ."""
+    rid = row.get("packaging_id")
+    if rid is not None:
+        try:
+            s = str(rid).strip()
+            if s.lower().startswith("bad"):  # từ TB khi OPC lỗi
+                return  None
+            else:
+                return int(rid)
+        except (ValueError, TypeError):
+            return None
 
 def _same_bucket(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     """Two rows belong to the same segment if these key values are equal."""
@@ -161,7 +178,31 @@ def _safe_int(x: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
-def derive_state_points(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+
+
+def _sanitize_po(val: Optional[str], maxlen: int = 64) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    # Bỏ mọi chuỗi Bad… từ TB/OPC UA
+    if s.lower().startswith("bad"):
+        return None
+    # Clip chiều dài để tránh tràn DB
+    return s if len(s) <= maxlen else s[:maxlen]
+
+def _safe_po(val):
+    """Return sanitized PO; only keep meaningful strings."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or s.lower() in ("default", "none", "null"):
+        return None
+    if s.lower().startswith("bad"):  # từ TB khi OPC lỗi
+        return None
+    return s[:64]  # clip an toàn
+
+
+def derive_state_points(timeline: List[Dict[str, Any]], states_lookup: Dict[int, Dict[str, Any]],) -> List[Dict[str, Any]]:
     """
     Derive segments (start_ts, end_ts, state_id, reason_id, po, packaging_id, watchDog)
     from a normalized timeline (already unioned + forward-filled).
@@ -172,22 +213,29 @@ def derive_state_points(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     segments: List[Dict[str, Any]] = []
     cur = dict(timeline[0])
     cur["start_ts"] = cur["ts"]
-
+    
     for row in timeline[1:]:
         # same bucket => extend
         if _same_bucket(cur, row):
             continue
+
+        reason_id = _infer_reason_id(cur)
+        state_id = states_lookup.get(reason_id, {}).get("state_id")  
+        note = states_lookup.get(reason_id, {}).get("state_code")  
+        
+        # packaging_id = cur.get("packaging_id"),
+        packaging_id = _infer_packaging_id(cur)
 
         # close current segment
         prev_ts = row["ts"]
         seg = {
             "start_ts": cur["start_ts"],
             "end_ts": prev_ts,
-            "state_id": _safe_int(cur.get("machineState")),
-            "reason_id": _infer_reason_id(cur),
-            "po": cur.get("po"),
-            "packaging_id": cur.get("packaging_id"),
-            "watchDog": bool(cur.get("watchDog", True)),
+            "state_id": state_id,
+            "reason_id": reason_id,
+            "po": _safe_po(cur.get("processOrderNr")),
+            "packaging_id": packaging_id,
+            "note": note,
         }
         segments.append(seg)
 
@@ -197,14 +245,21 @@ def derive_state_points(timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     # finalize last
     last_ts = timeline[-1]["ts"]
+    reason_id = _infer_reason_id(cur)
+    state_id = states_lookup.get(reason_id, {}).get("state_id")
+    note = states_lookup.get(reason_id, {}).get("state_code")     
+    
+    packaging_id = cur.get("packaging_id"),
+    try: packaging_id = int(packaging_id) if packaging_id is not None else None
+    except: packaging_id = None  
     seg = {
         "start_ts": cur["start_ts"],
         "end_ts": last_ts,
-        "state_id": _safe_int(cur.get("machineState")),
-        "reason_id": _infer_reason_id(cur),
-        "po": cur.get("po"),
-        "packaging_id": cur.get("packaging_id"),
-        "watchDog": bool(cur.get("watchDog", True)),
+        "state_id": state_id,
+        "reason_id":  reason_id,
+        "po": _safe_po(cur.get("processOrderNr")),
+        "packaging_id": packaging_id,
+        "note": note,
     }
     segments.append(seg)
     return segments
@@ -339,13 +394,41 @@ def _trim_head(seg: Dict[str, Any], new_start) -> None:
         seg["start_ts"] = new_start
         _recalc_duration(seg)
 
-def _ensure_utc(dt: datetime) -> datetime:
-    """Convert naive datetime to UTC-aware if needed."""
+# def _ensure_utc(dt: datetime) -> datetime:
+#     """Convert naive datetime to UTC-aware if needed."""
+#     if dt is None:
+#         return None
+#     if dt.tzinfo is None:
+#         return dt.replace(tzinfo=timezone.utc)
+#     return dt.astimezone(timezone.utc)
+
+# from datetime import timezone
+
+def _ensure_utc(dt):
+    # Convert to timezone-aware UTC
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+def _to_epoch_ms(dt):
+    # dt must be UTC-aware
+    return int(dt.timestamp() * 1000)
+
+def _norm_epoch_ms(dt):
+    # full pipeline: dt(any) -> UTC-aware -> epoch_ms -> (optional rounding)
+    dt = _ensure_utc(dt)
+    # OPTIONAL: unify precision (drop microseconds noise)
+    # return (_to_epoch_ms(dt) // 1000) * 1000  # align to nearest second
+    return _to_epoch_ms(dt)
+
+def _ms_to_dt(ms):
+    # only if bạn cần quay lại datetime UTC-aware
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
 
 def merge_with_history(
     last_event: Optional[Dict[str, Any]],
@@ -363,7 +446,10 @@ def merge_with_history(
     """
     if not new_segments:
         return []
-
+    
+    if not last_event:
+        return new_segments
+    
     if last_event:
         last_event["start_ts"] = _ensure_utc(last_event.get("start_ts"))
         last_event["end_ts"] = _ensure_utc(last_event.get("end_ts"))
@@ -372,37 +458,52 @@ def merge_with_history(
         s["start_ts"] = _ensure_utc(s.get("start_ts"))
         s["end_ts"] = _ensure_utc(s.get("end_ts"))
     
-    if not last_event:
-        return new_segments
-
     segs = [dict(s) for s in new_segments]  # copy nông
     tol = timedelta(seconds=tolerance_sec)
 
     first = segs[0]
-
+    logger.debug("STEP-10: merge_with_history  -> last_event start_ts {}  end_ts {}",last_event["start_ts"], last_event["end_ts"])
+    logger.debug("STEP-10: merge_with_history-> new_segments start_ts {}  end_ts {}",new_segments[0]["start_ts"], new_segments[0]["end_ts"])
     # 1) Nếu last_event phủ hoàn toàn một phần các segment đầu → loại các segment bị "nuốt"
+    # i = 0
+    # while i < len(segs) and last_event["end_ts"] >= segs[i]["end_ts"]:
+    #     i += 1
+    # if i > 0:
+    #     segs = segs[i:]
+    #     if not segs:
+    #         return []
     i = 0
-    while i < len(segs) and last_event["end_ts"] >= segs[i]["end_ts"]:
+    while last_event and i < len(segs) and last_event["end_ts"] >= segs[i]["end_ts"]:
         i += 1
-    if i > 0:
-        segs = segs[i:]
-        if not segs:
-            return []
-
+    segs = segs[i:]
+    if not segs:
+        return []
+    first = segs[0]
+    logger.debug("STEP-10: merge_with_history -> 1: last_event phủ hoàn toàn một phần các segment đầu")
     # 2) Còn overlap một phần với segment đầu → cắt đầu
-    if segs and last_event["end_ts"] > segs[0]["start_ts"]:
-        _trim_head(segs[0], last_event["end_ts"])
+    # if segs and last_event["end_ts"] > segs[0]["start_ts"]:
+    #     _trim_head(segs[0], last_event["end_ts"])
+
+    if last_event and first["start_ts"] < last_event["end_ts"]:
+        first["start_ts"] = max(first["start_ts"], last_event["end_ts"])
 
     if not segs:
         return []
-
+    logger.debug("STEP-10: merge_with_history -> 2: Còn overlap một phần với segment đầu → cắt đầu")
     first = segs[0]
 
     # 3) Nếu cùng bucket và sát nhau → gộp bằng cách mở rộng về start_ts của last_event
-    gap = first["start_ts"] - last_event["end_ts"]
-    if _same_bucket(last_event, first) and abs(gap) <= tol:
+    # gap = first["start_ts"] - last_event["end_ts"]
+    # if _same_bucket(last_event, first) and abs(gap) <= tol:
+    #     first["start_ts"] = min(first["start_ts"], last_event["start_ts"])
+    #     _recalc_duration(first)
+    MERGE_GAP_SEC = 2  # ví dụ 1-2 giây để hút nhiễu, khác với tolerance_sec của overlap
+
+    gap = (first["start_ts"] - last_event["end_ts"])
+    same_state = (last_event.get("state_id") == first.get("state_id"))
+    if same_state and abs(gap.total_seconds()) <= MERGE_GAP_SEC:
+        # nối liền mạch: cho phép chạm nhau hoặc lệch vài giây
         first["start_ts"] = min(first["start_ts"], last_event["start_ts"])
-        _recalc_duration(first)
 
     # 4) Loại các segment rỗng sau khi cắt
     segs = [s for s in segs if s["end_ts"] > s["start_ts"]]
@@ -573,7 +674,7 @@ def attach_hash(segments: List[Segment], device_uuid: str) -> List[Segment]:
         # dùng các trụ cột đảm bảo idempotent
         m.update(str(device_uuid).encode())
         m.update(str(int(s["start_ts"].timestamp() * 1000)).encode())
-        m.update(str(int(s["end_ts"].timestamp() * 1000)).encode())
+        # m.update(str(int(s["end_ts"].timestamp() * 1000)).encode())
         m.update(str(s.get("reason_id")).encode())   # None -> "None"
         m.update(str(s.get("po")).encode())
         m.update(str(s.get("packaging_id")).encode())
@@ -620,46 +721,43 @@ def rows_for_upsert(
     """
     Biến các segment (đã có hash_key) thành các dòng để upsert vào fact_state_event.
     """
+    
     out: List[Row] = []
+    logger.debug("[DEBUG]rows_for_upsert: segments {} ",len(segments))
     for s in segments:
         start_ts: datetime = s["start_ts"]
         end_ts:   datetime = s["end_ts"]
         if start_ts.tzinfo is None: start_ts = start_ts.replace(tzinfo=timezone.utc)
         if end_ts.tzinfo is None:   end_ts   = end_ts.replace(tzinfo=timezone.utc)
 
-        reason_id: Optional[int] = s.get("reason_id")
+        reason_id = s.get("reason_id")
         po = s.get("po")
         packaging_id = s.get("packaging_id")
-        watchDog = bool(s.get("watchDog", False))
-
+        
         # map reason -> state theo Option B
-        state_id: Optional[int] = None
-        note: Optional[str] = None
-        if reason_id is not None and reason_id in states_lookup:
-            state_id = states_lookup[reason_id].get("state_id")
-            # note có thể lấy luôn state_code để người xem dễ nhận biết
-            note = states_lookup[reason_id].get("state_code")
-
+        state_id = s.get("state_id")
+        note = s.get("note")
+        
         # shift
         shift_id = shift_lookup_fn(start_ts) if shift_lookup_fn else None
 
-        duration_sec = (end_ts - start_ts).total_seconds()
-
         out.append({
             "hash_key": s["hash_key"],
+            "device_uuid": device_meta.get("device_id"),
             "line_id":  device_meta.get("line_id"),
             "machine_id": device_meta.get("machine_id"),
             "state_id": state_id,
             "reason_id": reason_id,
             "start_ts": start_ts,
             "end_ts": end_ts,
-            "duration_sec": int(duration_sec),
             "shift_id": shift_id,
             "po": po,
             "packaging_id": packaging_id,
             "note": note,
-            "watchdog": watchDog,
         })
+        # if device_meta.get("line_id") == 105:
+            # logger.debug("[DEBUG]rows_for_upsert: line_id {} | start_ts {} | end_ts {}| reason_id {}| state_id {}| note {}  ",device_meta.get("line_id"),start_ts,end_ts,reason_id,state_id,note)
+
     return out
 
 from zoneinfo import ZoneInfo

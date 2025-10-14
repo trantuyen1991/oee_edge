@@ -9,7 +9,6 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
-
 @dataclass(frozen=True)
 class SiteClock:
     """Snapshot of global time context for one ETL run."""
@@ -121,7 +120,41 @@ def site_to_utc(dt_site: datetime, site_tz: str) -> datetime:
     Example:
         utc_from = site_to_utc(from_local, "Asia/Ho_Chi_Minh")
     """
+    if dt_site is None:
+        return None
     tz = ZoneInfo(site_tz)
     if dt_site.tzinfo is None:
         dt_site = dt_site.replace(tzinfo=tz)  # assume naive is site time
     return dt_site.astimezone(timezone.utc)
+
+
+def utc_to_local_date(dt_utc: datetime, tz_name: str = "Asia/Ho_Chi_Minh") -> datetime.date:
+    """
+    Convert UTC datetime to local date in the specified timezone.
+
+    Args:
+        dt_utc (datetime): UTC-aware datetime (tzinfo=timezone.utc).
+        tz_name (str): Timezone name (e.g., "Asia/Ho_Chi_Minh", "UTC", "Europe/Berlin").
+
+    Returns:
+        date: Local date (without time).
+
+    Example:
+        >>> from datetime import datetime, timezone
+        >>> utc_dt = datetime(2025, 10, 14, 3, 30, tzinfo=timezone.utc)
+        >>> utc_to_local_date(utc_dt)
+        datetime.date(2025, 10, 14)
+    """
+    if dt_utc is None:
+        return None
+
+    # Nếu datetime chưa có tzinfo, mặc định coi là UTC
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+
+    try:
+        tz_local = ZoneInfo(tz_name)
+    except Exception:
+        tz_local = timezone.utc  # fallback nếu timezone không hợp lệ
+
+    return dt_utc.astimezone(tz_local).date()

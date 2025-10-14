@@ -77,7 +77,9 @@ def prepare_stmt_ts_range(session: Session) -> PreparedStatement:
         SELECT key, ts, bool_v, str_v, long_v, dbl_v
         FROM ts_kv_cf
         WHERE entity_type=? AND entity_id=? AND key=? AND partition=?
-          AND ts>? AND ts<=? ALLOW FILTERING
+          AND ts>? AND ts<=? 
+          ORDER BY ts DESC
+          ALLOW FILTERING
     """)
 
 def fetch_key_timeseries(
@@ -174,7 +176,7 @@ def read_timeseries_for_device(
         # logger.debug(
         #     "CQL >>> SELECT key, ts, bool_v, str_v, long_v, dbl_v "
         #     "FROM ts_kv_cf WHERE entity_type='DEVICE' AND entity_id={} AND key='{}' "
-        #     "AND partition IN ({}) AND ts>={} AND ts<{} ALLOW FILTERING;",
+        #     "AND partition IN ({}) AND ts>={} AND ts<{} ORDER BY ts DESC ALLOW FILTERING;",
         #     device_id, k, ",".join(map(str, part_list)), from_ms, to_ms
         # )
 
@@ -182,7 +184,10 @@ def read_timeseries_for_device(
         # rows = fetch_key_timeseries(session, ps, device_id, k, part_list, from_ms, to_ms, page_size=page_size)
         rows.sort(key=lambda r: r["ts"])
         out[k] = rows
-        # logger.debug("Fetched key '{}'  points: {}  partitions={} ", k, len(rows), part_list)
+        # if k == "machineState" :
+        #     logger.debug("Fetched key '{}'  points: {}  partitions={} ", k, len(rows), part_list)
+        #     for idx, item in enumerate(out[k]):
+        #         logger.debug(f"Row {idx+1}: {item}")
     return out
 
 def discover_keys_for_device(

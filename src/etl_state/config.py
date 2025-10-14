@@ -23,6 +23,14 @@ class DomainTags:
     reset: Optional[str] = None
 
 @dataclass
+class EtlCfg:
+    raw_window_min: int
+    overlap_min: int
+    lookback_h: int
+    min_lookback_h: int
+    max_lookback_h: int
+    
+@dataclass
 class DomainCfg:
     tags: DomainTags
     devices: List[str]
@@ -38,6 +46,7 @@ class Config:
 
     # Job-specific from YAML (with ENV expansion)
     app: AppCfg
+    etl_state: EtlCfg
     domain: DomainCfg
 
 def _expand_env(s: str) -> str:
@@ -93,9 +102,11 @@ def load_config(path: str) -> Config:
 
     # YAML (job)
     app_raw = raw.get("app", {})
+    etl_raw = raw.get("etl_state", {})
     dom_raw = raw.get("domain", {})
     # Allow ${ENV} in YAML values
     app_raw = {k: _expand_env(v) for k, v in app_raw.items()}
+    etl_raw = {k: _expand_env(v) for k, v in etl_raw.items()}
     dom_tags_raw = {k: _expand_env(v) for k, v in (dom_raw.get("tags") or {}).items()}
     dom_devices = dom_raw.get("devices", []) or []
 
@@ -109,6 +120,15 @@ def load_config(path: str) -> Config:
         debounce_ms=int(app_raw.get("debounce_ms", 1000)),
     )
 
+    etl = EtlCfg(
+        raw_window_min=int(etl_raw.get("raw_window_min", 60)),
+        overlap_min=int(etl_raw.get("overlap_min", 5)),
+        lookback_h=int(etl_raw.get("lookback_h", 24)),
+        min_lookback_h=int(etl_raw.get("min_lookback_h", 1)),
+        max_lookback_h=int(etl_raw.get("max_lookback_h", 72)),
+    )
+
+    
     tags = DomainTags(
         machine_state=dom_tags_raw.get("machine_state", "machineState"),
         counter=dom_tags_raw.get("counter", "producedCounterPC"),
@@ -126,6 +146,7 @@ def load_config(path: str) -> Config:
         cas_port=cas_port,
         site_timezone=site_tz_env,
         app=app,
+        etl_state=etl,
         domain=domain,
     )
     validate_config(cfg)
