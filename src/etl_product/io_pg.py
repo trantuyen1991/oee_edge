@@ -3,9 +3,9 @@ from typing import Optional, Dict, Any, List, Tuple, Set
 import os
 import psycopg
 from psycopg.rows import dict_row
-from datetime import date
-
+from datetime import datetime, timedelta, timezone, date
 import logging
+
 try:
     # psycopg3 style error (psycopg 3.x)
     from psycopg.errors import StringDataRightTruncation, DataError as PsyDataError
@@ -61,8 +61,12 @@ DO UPDATE SET
     runtime_sec   = EXCLUDED.runtime_sec,
     planned_sec   = EXCLUDED.planned_sec;
 """
+def clamp_str(v, n):
+    if v is None:
+        return None
+    return str(v)[:n]
 
-def upsert_fact_min(conn, rows: List[Dict[str, Any]]) -> int:
+def upsert_fact_min(conn, rows: List[Dict[str, Any]], logger) -> int:
     """
     Upsert a list of minute rows into fact_production_min.
     Returns number of affected rows.
@@ -70,7 +74,20 @@ def upsert_fact_min(conn, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
     with conn.cursor() as cur:
-        cur.executemany(UPSERT_FACT_MIN, rows)
+        sql = UPSERT_FACT_MIN
+        # Sanity check
+        assert isinstance(rows, list) and all(isinstance(r, dict) for r in rows)
+        # (Optional) log gọn, không đụng vào rows
+        # logger.debug(f"Upsert {len(rows)} rows into fact_production_min" )
+        # logger.opt(lazy=True).debug("First row: {}", lambda: rows[0] if rows else None)
+        # logger.opt(lazy=True).debug(f"SQL:\n{sql}" )
+            
+        for r in rows:
+            r["process_order"] = clamp_str(r.get("process_order"), 50)   # VARCHAR(50)
+        BATCH_SIZE = 1000
+        for i in range(0, len(rows), BATCH_SIZE):
+            cur.executemany(sql, rows[i:i+BATCH_SIZE])     
+        # cur.executemany(sql, rows)
     return len(rows)
 
 def load_packaging_snapshot(conn) -> Dict[int, Dict[str, Any]]:
@@ -362,3 +379,67 @@ def upsert_state_event_batch(
             raise
 
     return total
+
+# from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+SITE_TZ = ZoneInfo(os.getenv("SITE_TIMEZONE", "Asia/Ho_Chi_Minh"))
+def get_last_ts_min(pg: psycopg.Connection, line_id: int) -> datetime | None:
+    """
+    Get the latest processed minute (UTC, floor to minute) from fact_production_min for a line.
+    
+    Args:
+        pg: psycopg connection.
+        line_id: Production line id.
+
+    Returns:
+        datetime | None: Max(ts_min) in UTC if exists else None.
+    """
+    sql = "SELECT MAX(ts_min) FROM fact_production_min WHERE line_id = %(line_id)s"
+    with pg.cursor() as cur:
+        cur.execute(sql, {"line_id": line_id})
+        row = cur.fetchone()
+        ts = row[0] if row and row[0] is not None else None
+        if ts is None:
+            return None
+        # ts trả về là naive (timestamp without time zone)
+        if ts.tzinfo is None:
+            # GIẢI THÍCH: giá trị thực tế lưu theo giờ địa phương
+            ts = ts.replace(tzinfo=SITE_TZ)
+        else:
+            ts = ts.astimezone(SITE_TZ)
+        # Chuyển về UTC để tính toán chuẩn
+        ts_utc = ts.astimezone(timezone.utc)
+        return ts_utc.replace(second=0, microsecond=0)
+
+def compute_from_to_auto(pg: psycopg.Connection, line_id: int, cap_min: int) -> tuple[datetime, datetime, int, Optional[datetime]]:
+    """
+    Compute processing window [from_utc, to_utc) using fact_production_min watermark.
+    - Uses 'cap_min' as the MAX backfill (your current BACKFILL_MIN).
+    - If there is a gap smaller than cap, only process that gap.
+    - If there's no history, process exactly 'cap_min' minutes.
+
+    Args:
+        pg: psycopg connection.
+        line_id: Production line id.
+        cap_min: Maximum minutes to backfill (use BACKFILL_MIN).
+
+    Returns:
+        (from_utc, to_utc, backfill_min)
+    """
+    # Use floored "now" to keep minute edges stable
+    to_utc = datetime.now(tz=timezone.utc).replace(second=0, microsecond=0)
+
+    last_ts = get_last_ts_min(pg, line_id)
+    if last_ts is None:
+        backfill_min = cap_min
+    else:
+        # Compute gap in minutes from last processed minute up to 'to_utc'
+        gap = int((to_utc - last_ts).total_seconds() // 60)
+        if gap < 1:
+            # Nothing new; still process at least 1 minute to keep pipeline alive
+            gap = 1
+        # Clamp by cap
+        backfill_min = min(cap_min, gap)
+
+    from_utc = to_utc - timedelta(minutes=backfill_min)
+    return from_utc, to_utc, backfill_min, last_ts

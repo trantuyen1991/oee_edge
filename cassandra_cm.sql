@@ -1,4 +1,4 @@
--- Active: 1759913719126@@127.0.0.1@9042@thingsboard
+-- Active: 1760120419218@@127.0.0.1@5432@oee
 USE thingsboard;
 SELECT partition
 FROM ts_kv_partitions_cf
@@ -19,10 +19,13 @@ LIMIT 20 ALLOW FILTERING;
 
 
 -- Xem thử có key nào trong partition
-SELECT key, ts FROM ts_kv_cf
+SELECT 
+key,
+(ts   AT TIME ZONE 'Asia/Ho_Chi_Minh') AS ts
+FROM ts_kv_cf
 WHERE entity_type='DEVICE' AND entity_id= e5e7ded0-a27f-11f0-aba6-91052cba3a97
   AND partition= 1759276800000
-  AND ts >= 1760110560000 AND ts < 1760196960000
+  AND ts >= 1760499000000 AND ts < 1760502600000
 LIMIT 50 ALLOW FILTERING;
 
 -- Lấy mẫu 1 key cụ thể

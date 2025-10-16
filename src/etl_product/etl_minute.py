@@ -20,13 +20,19 @@ from io_pg import (
     load_packaging_snapshot,     # optional
     load_planned_reason_codes,   # NEW
     load_shifts_by_date,          # NEW
-    load_device_map
+    load_device_map,
+    compute_from_to_auto
 )
 
 from utils import (
     minute_range_to_finalize, to_epoch_ms, floor_to_minute,
     get_site_tz, minute_in_any_shift  # NEW
 )
+import asyncio
+import os
+from src.api.post_etl_minute import  process_batch
+from src.api.token_map import load_token_map
+
 # ---- Configuration placeholders ----
 ROOT = Path(__file__).resolve().parents[1]                   # project root: /home/admin/oee-edge
 ENV_PATH = ROOT / ".env"                                     # expected .env path
@@ -39,12 +45,14 @@ K_STATE    = os.getenv("KEY_STATE",    "machineState")
 K_PO       = os.getenv("KEY_PO",       "processOrderNr")
 K_PACK     = os.getenv("KEY_PACK",     "packaging_id")
 RUN_CODE   = int(os.getenv("RUN_CODE", "9999"))
-
-
+BACKFILL_MIN = int(os.getenv("BACKFILL_MIN", "43200"))
 COUNTER_KEYS = {"good": "good_cum", "ng": "reject_cum"}
 STATE_KEY = "state"  # RUN/STOP/...
 
 DEFAULT_PLANNED_SEC = 60  # usually 60s unless planned stop window
+
+UPSERT_PG= os.getenv("UPSERT_PG", "true")
+PUBLISH_TB= os.getenv("PUBLISH_TB", "true")
 
 def env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -84,26 +92,26 @@ def compute_minute_deltas(cum_series: List[tuple], minute_edges_ms: List[int]) -
     """
     if not cum_series:
         return {ms: 0 for ms in minute_edges_ms}
-    # Convert to DataFrame for simpler alignment
-    df = pd.DataFrame(cum_series, columns=["ts", "val"]).sort_values("ts")
-    df = df.drop_duplicates(subset=["ts"], keep="last")
-    df = df.set_index("ts")
 
-    # Reindex on minute edges including one extra left boundary
+    df = pd.DataFrame(cum_series, columns=["ts", "val"]).sort_values("ts")
+    df = df.drop_duplicates(subset=["ts"], keep="last").set_index("ts")
+
     all_edges = sorted(minute_edges_ms + [minute_edges_ms[0] - 1])
     s = df["val"].astype(float)
-    # Forward fill to edges
-    s_ff = s.reindex(all_edges, method="pad")
-    # Compute delta between consecutive minute edges
+    s_ff = s.reindex(all_edges, method="pad")   # chỉ ffill
+
     deltas = {}
     for i in range(1, len(all_edges)):
         left = all_edges[i-1]
         right = all_edges[i]
-        # The minute bucket corresponds to 'right' as start of minute bucket
-        # (since we added left sentinel at (first-1))
-        delta = max(0, int(round(s_ff.loc[right] - s_ff.loc[left])))
+        lv = s_ff.loc[left]
+        rv = s_ff.loc[right]
+        if pd.isna(lv) or pd.isna(rv):
+            delta = 0                          # CHỐT: thiếu biên -> không đếm
+        else:
+            delta = max(0, int(round(rv - lv)))
         deltas[right] = delta
-    # Return only buckets that match minute_edges_ms
+
     return {ms: deltas.get(ms, 0) for ms in minute_edges_ms}
 
 def compute_runtime_sec(state_timeline: List[tuple], minute_start_ms: int) -> int:
@@ -154,17 +162,7 @@ def main():
     else:
         logger.info("DRY_RUN = False -> UPSERT to PostgreSQL enabled")
 
-    now_utc = datetime.now(timezone.utc)
-    from_min_utc, to_min_utc = minute_range_to_finalize(now_utc)
-    logger.info(f"[DRY-RUN] Minute window: {from_min_utc} .. {to_min_utc} (UTC)")
-
-    # Build minute edges
-    minute_edges = []
-    cur = from_min_utc
-    while cur < to_min_utc:
-        minute_edges.append(to_epoch_ms(cur))
-        cur += timedelta(minutes=1)
-
+    
     cas = get_cas_session()
 
     # >>> ADD: PG connection + metadata (kết nối mở suốt vòng chạy)
@@ -172,20 +170,40 @@ def main():
     site_tz = get_site_tz()
     device_map = load_device_map(pg)  # {device_uuid: (line_id, machine_id)}
     logger.info(f"Loaded {len(device_map)} devices from dim_device.")
+    
+    # PG_DSN = str(os.getenv("PG_DSN", "postgresql+psycopg://postgres:admin@127.0.0.1:5432/oee"))
+    token_map = load_token_map(pg)  
+    logger.info(f"Loaded {len(token_map)} devices from dim_device.")
+    logger.info(f"First 5 token_map items: {list(token_map.items())[:5]}")      
+    
     planned_codes = load_planned_reason_codes(pg)
     logger.info(f"Loaded {len(planned_codes)} planned reason codes from PG.")
 
-    from_local = from_min_utc.astimezone(site_tz).date()
-    to_local   = (to_min_utc - timedelta(microseconds=1)).astimezone(site_tz).date()
-    shifts_by_day = load_shifts_by_date(pg, from_local - timedelta(days=1), to_local)
-
+    
     total_rows = 0  # >>> ADD (đếm tổng upsert)
 
-    try:
-        ts_from_ms = minute_edges[0] - 120000
-        ts_to_ms   = minute_edges[-1] + 120000
-
+    try: 
         for dev_id, (line_id, machine_id) in device_map.items():
+            
+            from_utc, to_utc, backfill_min, last_ts = compute_from_to_auto(pg, line_id, BACKFILL_MIN)
+            logger.info("[LINE {}] last_ts ={} Auto backfill = {} min (cap={})", line_id, last_ts, backfill_min, BACKFILL_MIN)
+            logger.info("[LINE {}] from_utc ={} to_utc = {}", line_id, from_utc, to_utc)
+            ts_from_ms = to_epoch_ms(from_utc) - 120000 
+            ts_to_ms   = to_epoch_ms(to_utc) + 120000
+
+            # now_utc = datetime.now(timezone.utc)
+            # from_min_utc, to_min_utc = minute_range_to_finalize(now_utc,backfill_min)
+            # logger.info(f"[DRY-RUN] Minute window: {from_min_utc} .. {to_min_utc} (UTC)")
+
+            from_local = from_utc.astimezone(site_tz).date()
+            to_local   = (to_utc - timedelta(microseconds=1)).astimezone(site_tz).date()
+            shifts_by_day = load_shifts_by_date(pg, from_local - timedelta(days=1), to_local)
+            # Build minute edges
+            minute_edges = []
+            cur = from_utc
+            while cur < to_utc:
+                minute_edges.append(to_epoch_ms(cur))
+                cur += timedelta(minutes=1)
 
             # --- fetch cumulative counters ---
             produced_series = fetch_timeseries_numeric(cas, dev_id, K_PRODUCED, ts_from_ms, ts_to_ms)
@@ -244,13 +262,17 @@ def main():
                 if pack_series:
                     packaging_id = next((int(val) for ts,val in reversed(pack_series) if ts <= ms), None)
 
+                
+                if po and (po.startswith("Bad status code:") or po == ""):
+                    po = None
+                    
                 # Log luôn (kể cả khi sẽ upsert)
                 logger.info(
                     f"[LINE {line_id}] ts_min={ts_min_utc.isoformat()} in_shift={in_shift} "
                     f"produced={produced} good={good} ng={ng} runtime_sec={runtime_sec} "
                     f"planned_sec={planned_sec} po={po} packaging_id={packaging_id}"
                 )
-
+                
                 if not DRY_RUN:
                     batch_rows.append({
                         "ts_min": ts_min_utc,
@@ -265,10 +287,31 @@ def main():
                     })
 
             if not DRY_RUN and batch_rows:
-                # upsert theo batch (psycopg executemany) — 1 batch/line là đủ vì số bản ghi ít
-                affected = upsert_fact_min(pg, batch_rows)
-                total_rows += affected
-                logger.info(f"UPSERT fact_production_min: line={line_id}, rows={affected}")
+                if UPSERT_PG:
+                    # upsert theo batch (psycopg executemany) — 1 batch/line là đủ vì số bản ghi ít
+                    affected = upsert_fact_min(pg, batch_rows,logger)
+                    total_rows += affected
+                    logger.info(f"UPSERT fact_production_min: line={line_id}, rows={affected}")
+                if PUBLISH_TB:
+                    
+                    lines_data = [
+                        {
+                            "line_id": line_id,
+                            "minute_end_utc_ms": to_epoch_ms(ts_min_utc),
+                            "kpi": {
+                                # "process_order": str(po),
+                                # "packaging_id": int(packaging_id) if packaging_id is not None else 0,
+                                "produced": int(produced),
+                                "good": int(good),
+                                "ng": int(ng),
+                                "runtime_sec": int(runtime_sec),
+                                "planned_sec": int(planned_sec),
+                                "version": "1.0.0"
+                            }
+                        }
+                    ]
+                    logger.info(f"Publishing to TB: line={line_id}, rows={lines_data}")
+                    asyncio.run(process_batch(lines_data, token_map, logger=logger))
 
     except Exception as e:
         logger.exception(f"Dry-run ETL failed: {e}")

@@ -4,5 +4,8 @@ pandas==2.*
 python-dotenv==1.*
 pytz==2024.*
 loguru==0.7.*
-SQLAlchemy>=2.*
-PyYAML>=6.*
+SQLAlchemy==2.*
+PyYAML==6.*
+fastapi
+uvicorn
+httpx

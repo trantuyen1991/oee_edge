@@ -7,7 +7,7 @@ def floor_to_minute(dt_utc: datetime) -> datetime:
     """Return dt floored to :00 seconds in UTC."""
     return dt_utc.replace(second=0, microsecond=0, tzinfo=timezone.utc)
 
-def minute_range_to_finalize(now_utc: datetime) -> Tuple[datetime, datetime]:
+def minute_range_to_finalize(now_utc: datetime, backfill_min : int) -> Tuple[datetime, datetime]:
     """
     Decide which minute buckets to finalize using watermark/backfill.
     Example:
@@ -16,7 +16,7 @@ def minute_range_to_finalize(now_utc: datetime) -> Tuple[datetime, datetime]:
     Returns (from_inclusive, to_exclusive) in UTC minute boundaries.
     """
     wm = int(os.getenv("WATERMARK_SEC", "120"))
-    bf = int(os.getenv("BACKFILL_MIN", "3"))
+    bf = backfill_min #int(os.getenv("BACKFILL_MIN", "3"))
 
     # Determine the last fully-watermarked minute
     last_ok = floor_to_minute(now_utc - timedelta(seconds=wm))

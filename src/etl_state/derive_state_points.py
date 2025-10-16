@@ -134,11 +134,11 @@ UNKNOWN_REASON_ID = int(os.getenv("UNKNOWN_REASON_ID", "0000"))
 OFFLINE_REASON_ID = int(os.getenv("OFFLINE_REASON_ID", "0"))
 COMM_LOSS_CODE  = int(os.getenv("COMM_LOSS_CODE", "9000"))
 
-def _infer_reason_id(row: Dict[str, Any]) -> int:
+def _infer_reason_id(row: Dict[str, Any]) -> int | None:
     """Infer reason_id based on machineState, watchDog, etc."""
     rid = row.get("machineState")
     if rid is None:
-        return UNKNOWN_REASON_ID
+        return None
     if rid is not None:
         try:
             s = str(rid).strip()
@@ -202,32 +202,48 @@ def _safe_po(val):
     return s[:64]  # clip an toàn
 
 
-def derive_state_points(timeline: List[Dict[str, Any]], states_lookup: Dict[int, Dict[str, Any]],) -> List[Dict[str, Any]]:
+def derive_state_points(
+    timeline: List[Dict[str, Any]], 
+    states_lookup: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """
-    Derive segments (start_ts, end_ts, state_id, reason_id, po, packaging_id, watchDog)
-    from a normalized timeline (already unioned + forward-filled).
+    Phân tích chuỗi trạng thái (timeline) đã được chuẩn hóa và forward-fill, chuyển thành các đoạn trạng thái liên tục.
+
+    Args:
+        timeline (List[Dict[str, Any]]): Danh sách các dict trạng thái, mỗi dict chứa thông tin tại một thời điểm.
+        states_lookup (Dict[int, Dict[str, Any]]): Bảng ánh xạ reason_id sang thông tin trạng thái (state_id, state_code,...).
+
+    Returns:
+        List[Dict[str, Any]]: Danh sách các đoạn trạng thái liên tục, mỗi đoạn gồm start_ts, end_ts, state_id, reason_id, po, packaging_id, note.
+
+    Quy trình:
+        - Duyệt qua timeline, gom các trạng thái liên tục giống nhau thành một đoạn.
+        - Khi trạng thái thay đổi, kết thúc đoạn hiện tại và bắt đầu đoạn mới.
+        - Mỗi đoạn lưu thông tin về thời gian, trạng thái, lý do, PO, bao bì, ghi chú.
     """
     if not timeline:
+        # Nếu không có dữ liệu đầu vào, trả về danh sách rỗng
         return []
 
-    segments: List[Dict[str, Any]] = []
+    segments: List[Dict[str, Any]] = []  # Danh sách kết quả các đoạn trạng thái
+
+    # Khởi tạo đoạn đầu tiên từ trạng thái đầu tiên
     cur = dict(timeline[0])
     cur["start_ts"] = cur["ts"]
-    
+
+    # Duyệt qua các trạng thái tiếp theo trong timeline
     for row in timeline[1:]:
-        # same bucket => extend
+        # Nếu trạng thái không đổi (cùng bucket), tiếp tục kéo dài đoạn hiện tại
         if _same_bucket(cur, row):
             continue
 
+        # Nếu trạng thái thay đổi, kết thúc đoạn hiện tại
         reason_id = _infer_reason_id(cur)
-        state_id = states_lookup.get(reason_id, {}).get("state_id")  
-        note = states_lookup.get(reason_id, {}).get("state_code")  
-        
-        # packaging_id = cur.get("packaging_id"),
+        state_id = states_lookup.get(reason_id, {}).get("state_id") if reason_id is not None else None
+        note = states_lookup.get(reason_id, {}).get("state_code") if reason_id is not None else None
         packaging_id = _infer_packaging_id(cur)
 
-        # close current segment
-        prev_ts = row["ts"]
+        prev_ts = row["ts"]  # Thời điểm kết thúc đoạn hiện tại
         seg = {
             "start_ts": cur["start_ts"],
             "end_ts": prev_ts,
@@ -239,29 +255,29 @@ def derive_state_points(timeline: List[Dict[str, Any]], states_lookup: Dict[int,
         }
         segments.append(seg)
 
-        # start new
+        # Bắt đầu đoạn mới từ trạng thái hiện tại
         cur = dict(row)
         cur["start_ts"] = row["ts"]
 
-    # finalize last
+    # Sau khi duyệt hết, chốt lại đoạn cuối cùng
     last_ts = timeline[-1]["ts"]
+    if last_ts <= cur["start_ts"]:
+        last_ts = datetime.now(tz=timezone.utc)
     reason_id = _infer_reason_id(cur)
-    state_id = states_lookup.get(reason_id, {}).get("state_id")
-    note = states_lookup.get(reason_id, {}).get("state_code")     
-    
-    packaging_id = cur.get("packaging_id"),
-    try: packaging_id = int(packaging_id) if packaging_id is not None else None
-    except: packaging_id = None  
+    state_id = states_lookup.get(reason_id, {}).get("state_id") if reason_id is not None else None
+    note = states_lookup.get(reason_id, {}).get("state_code") if reason_id is not None else None
+    packaging_id = _infer_packaging_id(cur)
     seg = {
         "start_ts": cur["start_ts"],
         "end_ts": last_ts,
         "state_id": state_id,
-        "reason_id":  reason_id,
+        "reason_id": reason_id,
         "po": _safe_po(cur.get("processOrderNr")),
         "packaging_id": packaging_id,
         "note": note,
     }
     segments.append(seg)
+
     return segments
 
 # ---- STEP-08C - Compress to intervals  ----
@@ -444,8 +460,12 @@ def merge_with_history(
       - Nếu cùng bucket và sát nhau (|gap| <= tolerance): gộp thành 1 segment (start = last_event.start_ts).
       - Bỏ mọi segment có duration_sec <= 0 sau khi cắt.
     """
+    segs = [dict(s) for s in new_segments]  # copy nông
     if not new_segments:
-        return []
+        if last_event:
+            segs = [last_event]  # wrap single dict in a list
+            segs[0]["end_ts"] = datetime.now(tz=timezone.utc)
+        return segs
     
     if not last_event:
         return new_segments
@@ -458,20 +478,15 @@ def merge_with_history(
         s["start_ts"] = _ensure_utc(s.get("start_ts"))
         s["end_ts"] = _ensure_utc(s.get("end_ts"))
     
-    segs = [dict(s) for s in new_segments]  # copy nông
+    # segs = [dict(s) for s in new_segments]  # copy nông
     tol = timedelta(seconds=tolerance_sec)
 
     first = segs[0]
     logger.debug("STEP-10: merge_with_history  -> last_event start_ts {}  end_ts {}",last_event["start_ts"], last_event["end_ts"])
-    logger.debug("STEP-10: merge_with_history-> new_segments start_ts {}  end_ts {}",new_segments[0]["start_ts"], new_segments[0]["end_ts"])
+    for s in segs:
+        logger.debug("STEP-10: merge_with_history -> new_segments start_ts {}  end_ts {}",s["start_ts"], s["end_ts"])
+    # logger.debug("STEP-10: merge_with_history-> new_segments start_ts {}  end_ts {}",new_segments[0]["start_ts"], new_segments[0]["end_ts"])
     # 1) Nếu last_event phủ hoàn toàn một phần các segment đầu → loại các segment bị "nuốt"
-    # i = 0
-    # while i < len(segs) and last_event["end_ts"] >= segs[i]["end_ts"]:
-    #     i += 1
-    # if i > 0:
-    #     segs = segs[i:]
-    #     if not segs:
-    #         return []
     i = 0
     while last_event and i < len(segs) and last_event["end_ts"] >= segs[i]["end_ts"]:
         i += 1
@@ -481,9 +496,6 @@ def merge_with_history(
     first = segs[0]
     logger.debug("STEP-10: merge_with_history -> 1: last_event phủ hoàn toàn một phần các segment đầu")
     # 2) Còn overlap một phần với segment đầu → cắt đầu
-    # if segs and last_event["end_ts"] > segs[0]["start_ts"]:
-    #     _trim_head(segs[0], last_event["end_ts"])
-
     if last_event and first["start_ts"] < last_event["end_ts"]:
         first["start_ts"] = max(first["start_ts"], last_event["end_ts"])
 
@@ -493,10 +505,6 @@ def merge_with_history(
     first = segs[0]
 
     # 3) Nếu cùng bucket và sát nhau → gộp bằng cách mở rộng về start_ts của last_event
-    # gap = first["start_ts"] - last_event["end_ts"]
-    # if _same_bucket(last_event, first) and abs(gap) <= tol:
-    #     first["start_ts"] = min(first["start_ts"], last_event["start_ts"])
-    #     _recalc_duration(first)
     MERGE_GAP_SEC = 2  # ví dụ 1-2 giây để hút nhiễu, khác với tolerance_sec của overlap
 
     gap = (first["start_ts"] - last_event["end_ts"])
@@ -762,7 +770,7 @@ def rows_for_upsert(
 
 from zoneinfo import ZoneInfo
 def make_shift_lookup(
-    shift_rows: List[Dict[str, any]],
+    shift_rows: List[Dict[str, Any]],
     site_tz: ZoneInfo,                         # pytz / zoneinfo tz, ví dụ ZoneInfo("Asia/Ho_Chi_Minh")
 ) -> Callable[[datetime], Optional[int]]:
     """
@@ -774,8 +782,8 @@ def make_shift_lookup(
 
     # Cache spans theo ngày local để đỡ build nhiều lần
     # key = date (local), value = list[(start_utc, end_utc, shift_id)]
-    spans_cache: Dict[datetime.date, List[Tuple[datetime, datetime, int]]] = {}
-
+    spans_cache: Dict[date, List[Tuple[datetime, datetime, int]]] = {}
+    # spans_cache: Dict[datetime.date, List[Tuple[datetime, datetime, int]]] = {}
     def _as_time(v) -> time:
         # Phòng khi start_time/end_time là string hoặc datetime
         if isinstance(v, time):
@@ -787,7 +795,7 @@ def make_shift_lookup(
             return datetime.strptime(v, "%H:%M:%S").time()
         raise TypeError(f"Unsupported time value: {type(v)}")
 
-    def _build_spans_for_local_day(d: datetime.date):
+    def _build_spans_for_local_day(d: date):
         spans = []
         for r in shift_rows:
             st = _as_time(r["start_time"])

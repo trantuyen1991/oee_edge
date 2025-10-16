@@ -107,3 +107,9 @@ sudo systemctl start oee-state.service
 sudo systemctl status oee-state.service
 sudo journalctl -u oee-state.service -n 200 --no-pager
 sudo journalctl -xeu oee-state.timer -u oee-state.service
+
+/////////////////////////////////////////////////////////////////
+export TB_BASE_URL="http://localhost:8080"
+export TB_DEVICE_TOKEN="YOUR_DEVICE_TOKEN"
+
+uvicorn app:app --reload --host 0.0.0.0 --port 9000
